@@ -1,0 +1,11 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# @temporalio/core-bridge ships a native Rust binding compiled/fetched via a
+# postinstall script. pnpm 10 blocks all dependency lifecycle scripts by
+# default. Without this, `pnpm install` silently skips that step and
+# @temporalio/worker fails at runtime with a missing-binding error.
+onlyBuiltDependencies:
+  - "@temporalio/core-bridge"
+  - "esbuild"

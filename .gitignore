@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.turbo/
+.env
+# Real runtime config (machine-specific paths) -- pipeline.example.yaml is
+# the tracked template to copy from.
+/pipeline.yaml
+*.log
+.DS_Store

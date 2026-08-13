@@ -1,0 +1,24 @@
+{
+  "name": "@issue-pipeline/worker",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/worker.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "node --import tsx --test src"
+  },
+  "dependencies": {
+    "@issue-pipeline/activities": "workspace:*",
+    "@issue-pipeline/core": "workspace:*",
+    "@temporalio/worker": "1.22.0",
+    "@temporalio/workflow": "1.22.0",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@temporalio/testing": "1.22.0",
+    "tsx": "^4.19.2"
+  }
+}

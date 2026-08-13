@@ -1,0 +1,66 @@
+export { PIPELINE_TASK_QUEUE } from "./task-queue";
+
+// loadTemporalConnectionConfig deliberately does NOT live here (or anywhere
+// in this package's export surface): workflow files import values from this
+// barrel, and Temporal's workflow bundler traces the whole thing -- a
+// node:path/dotenv-using function here would break the workflow sandbox
+// build. See apps/worker/src/env.ts and apps/cli/src/env.ts (duplicated on
+// purpose) for the actual loader.
+
+export { PLAN_WORKFLOW_NAME, planWorkflowId } from "./workflow-names";
+
+export {
+  kickoffSignal,
+  questionsAnsweredSignal,
+  resumeSignal,
+  skipSignal,
+  abortSignal,
+  planStatusQuery,
+  type KickoffPayload,
+  type AnswerItem,
+  type AnswersPayload,
+  type ResumePayload,
+  type SkipPayload,
+  type AbortPayload,
+  type PlanWorkflowState,
+  type PlanStatus,
+} from "./signals";
+
+export type { AgentRole, AdapterName, AgentResult } from "./contracts/agent";
+export type { WorklogStatus, WorklogSections } from "./contracts/worklog";
+export {
+  PipelineConfigError,
+  RoleNotConfiguredError,
+  WorklogContractViolationError,
+  PlannerOutputParseError,
+  GitOperationError,
+  GithubCliError,
+} from "./contracts/errors";
+export {
+  PhasePlanItemSchema,
+  OpenQuestionSchema,
+  PlannerOutputSchema,
+  slugify,
+  type PhasePlanItem,
+  type OpenQuestion,
+  type PlannerOutput,
+} from "./contracts/planner";
+export {
+  SubIssueMetadataSchema,
+  composeMetadataComment,
+  composeSubIssueBody,
+  parseSubIssueMetadata,
+  type SubIssueMetadata,
+} from "./contracts/sub-issue-metadata";
+export {
+  githubSlug,
+  buildPhaseBranchName,
+  buildPhaseWorktreePath,
+  type RegisteredRepo,
+} from "./contracts/repo";
+export {
+  PipelineConfigSchema,
+  parsePipelineConfig,
+  type RoleConfig,
+  type PipelineConfig,
+} from "./contracts/pipeline-config";

@@ -1,0 +1,19 @@
+{
+  "name": "@issue-pipeline/activities",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@issue-pipeline/adapters": "workspace:*",
+    "@issue-pipeline/core": "workspace:*",
+    "@temporalio/activity": "1.22.0",
+    "yaml": "^2.7.0"
+  }
+}

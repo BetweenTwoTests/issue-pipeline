@@ -1,0 +1,23 @@
+{
+  "name": "@issue-pipeline/core",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "node --import tsx --test src"
+  },
+  "dependencies": {
+    "@temporalio/workflow": "1.22.0",
+    "dotenv": "^17.4.2",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}

@@ -1,0 +1,43 @@
+# Copy to pipeline.yaml (repo root) and point PIPELINE_CONFIG_PATH at its
+# absolute path in .env. See packages/core/src/contracts/pipeline-config.ts
+# for the full schema this is validated against.
+version: 1
+
+roles:
+  planner:
+    adapter: claude
+    args: []
+    timeout_ms: 600000
+    max_budget_usd: 2.0
+  executor:
+    adapter: codex
+    args: []
+    timeout_ms: 1800000
+  fixer:
+    adapter: codex
+    args: []
+    timeout_ms: 1200000
+
+policy:
+  local_gates: advisory
+  max_fix_attempts: 2
+  auto_continue: true
+
+branching:
+  stack_tool: graphite
+  branch_prefix: pipe
+  remote: origin
+  pr_draft: false
+
+gates:
+  timeout_ms: 300000
+  commands:
+    - { name: typecheck, command: pnpm, args: ["turbo", "run", "typecheck"] }
+    - { name: test, command: pnpm, args: ["turbo", "run", "test"] }
+    - { name: lint, command: pnpm, args: ["turbo", "run", "lint"] }
+
+repos:
+  chronic-backend:
+    github: Flagler-Health/chronic-backend
+    local_path: ~/pipelines/chronic-backend/.repo
+    default_branch: main

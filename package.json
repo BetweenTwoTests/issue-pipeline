@@ -1,0 +1,24 @@
+{
+  "name": "issue-pipeline",
+  "private": true,
+  "version": "0.0.0",
+  "packageManager": "pnpm@10.34.1",
+  "engines": {
+    "node": ">=24.6.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "typecheck": "turbo run typecheck",
+    "lint": "turbo run lint",
+    "test": "turbo run test"
+  },
+  "devDependencies": {
+    "turbo": "2.10.9",
+    "typescript": "~6.0.0",
+    "eslint": "^9.19.0",
+    "@eslint/js": "^9.19.0",
+    "typescript-eslint": "^8.67.0",
+    "@types/node": "^24.0.0"
+  }
+}
