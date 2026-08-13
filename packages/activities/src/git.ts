@@ -11,7 +11,7 @@ async function git(args: string[], opts?: { cwd?: string }): Promise<string> {
     return stdout;
   } catch (err) {
     const stderr = isExecFileError(err) ? (err.stderr ?? err.message) : String(err);
-    throw new GitOperationError(`git ${args.join(" ")} failed`, args.join(" "), stderr);
+    throw new GitOperationError(`git ${args.join(" ")} failed: ${stderr.trim()}`, args.join(" "), stderr);
   }
 }
 
@@ -21,7 +21,7 @@ async function gt(args: string[], cwd: string): Promise<string> {
     return stdout;
   } catch (err) {
     const stderr = isExecFileError(err) ? (err.stderr ?? err.message) : String(err);
-    throw new GitOperationError(`gt ${args.join(" ")} failed`, args.join(" "), stderr);
+    throw new GitOperationError(`gt ${args.join(" ")} failed: ${stderr.trim()}`, args.join(" "), stderr);
   }
 }
 
@@ -33,7 +33,7 @@ async function gh(args: string[], cwd: string): Promise<string> {
     return stdout;
   } catch (err) {
     const stderr = isExecFileError(err) ? (err.stderr ?? err.message) : String(err);
-    throw new GitOperationError(`gh ${args.join(" ")} failed`, args.join(" "), stderr);
+    throw new GitOperationError(`gh ${args.join(" ")} failed: ${stderr.trim()}`, args.join(" "), stderr);
   }
 }
 
@@ -105,8 +105,21 @@ export async function createPhaseWorktree(input: CreatePhaseWorktreeInput): Prom
   const worktreePath = buildPhaseWorktreePath(os.homedir(), input.repo.name, input.rootIssueNumber, input.phase);
 
   if (await pathExists(worktreePath)) {
-    const sha = (await git(["rev-parse", "HEAD"], { cwd: worktreePath })).trim();
-    return { worktreePath, branch: input.newBranchName, initialCommitSha: sha };
+    const currentBranch = (await git(["branch", "--show-current"], { cwd: worktreePath })).trim();
+    if (currentBranch === input.newBranchName) {
+      const sha = (await git(["rev-parse", "HEAD"], { cwd: worktreePath })).trim();
+      return { worktreePath, branch: input.newBranchName, initialCommitSha: sha };
+    }
+    // Not on the expected branch -- a partial worktree left behind by an
+    // interrupted earlier attempt (an activity retry after `gt create`/
+    // `git checkout -b` failed partway, or a killed worker), verified via a
+    // real repro: reusing it as-is hands back a worktree with no real
+    // branch checked out, which then fails opaquely much later at
+    // commitWorktreeChanges ("Cannot perform this operation without a
+    // branch checked out" from gt, deterministically, on every retry).
+    // Tear it down and fall through to recreate it properly rather than
+    // trusting whatever state it was left in.
+    await removeWorktree(input.repo, worktreePath);
   }
 
   await fs.mkdir(path.dirname(worktreePath), { recursive: true });

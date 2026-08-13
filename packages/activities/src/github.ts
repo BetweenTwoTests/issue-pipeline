@@ -50,7 +50,7 @@ async function gh(args: string[]): Promise<string> {
     return stdout;
   } catch (err) {
     const stderr = isExecFileError(err) ? (err.stderr ?? err.message) : String(err);
-    throw new GithubCliError(`gh ${args.join(" ")} failed`, args.join(" "), stderr);
+    throw new GithubCliError(`gh ${args.join(" ")} failed: ${stderr.trim()}`, args.join(" "), stderr);
   }
 }
 
