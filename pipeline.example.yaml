@@ -3,6 +3,9 @@
 # for the full schema this is validated against.
 version: 1
 
+# adapter: claude | codex, per role -- swapping is a config edit, not a
+# code change (see packages/adapters). All three roles default to claude
+# here; codex is available once its CLI is upgraded (see README).
 roles:
   planner:
     adapter: claude
@@ -10,13 +13,15 @@ roles:
     timeout_ms: 600000
     max_budget_usd: 2.0
   executor:
-    adapter: codex
+    adapter: claude
     args: []
     timeout_ms: 1800000
+    max_budget_usd: 5.0
   fixer:
-    adapter: codex
+    adapter: claude
     args: []
     timeout_ms: 1200000
+    max_budget_usd: 3.0
 
 policy:
   local_gates: advisory

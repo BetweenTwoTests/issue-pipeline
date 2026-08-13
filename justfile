@@ -31,6 +31,14 @@ worker:
 build:
     pnpm turbo run build
 
-# Run a one-off `pipe` CLI command, e.g. `just pipe status`
+# Run a one-off `pipe` CLI command, e.g. `just pipe status` or
+# `just pipe start https://github.com/owner/repo/issues/123`.
+# (direct node invocation, not `pnpm exec pipe` -- pnpm does not self-link a
+# package's own `bin` entry into its own node_modules/.bin)
+# NOTE: `just`'s variadic capture does not preserve quoting -- a quoted
+# multi-word argument (e.g. `pipe answer`'s <text>, or --note) arrives here
+# already split on whitespace. For those, build once then invoke node
+# directly: `pnpm --filter @issue-pipeline/cli build && node apps/cli/dist/index.js answer <ref> 1 "answer text"`.
 pipe *ARGS:
-    pnpm --filter @issue-pipeline/cli exec pipe {{ARGS}}
+    pnpm --filter @issue-pipeline/cli build >/dev/null
+    node apps/cli/dist/index.js {{ARGS}}
