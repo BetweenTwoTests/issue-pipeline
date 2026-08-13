@@ -46,6 +46,20 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
+/** `gt parent` fails with "Cannot perform this operation on untracked
+ * branch" (verified directly) when the current branch was never registered
+ * via `gt create`/`gt track` -- the cheapest read-only way to tell a fully
+ * set up phase branch apart from one where `git checkout -b` succeeded but
+ * the following `gt track` did not. */
+async function isTrackedByGraphite(worktreePath: string): Promise<boolean> {
+  try {
+    await gt(["parent", "--no-interactive", "--quiet"], worktreePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Idempotent: if localPath already exists, only verifies remote.origin.fetch
  * is set correctly and returns. `git clone --bare` does NOT populate
@@ -94,10 +108,19 @@ export interface PhaseWorktree {
  * A branch already checked out in one worktree cannot be checked out again
  * in another -- this is why every phase (including phase 1, where parentRef
  * is just the default branch) detaches at the parent's tip first, then
- * materializes the new branch inside the worktree. This is Graphite's own
- * documented pattern for exactly this scenario, and it happens to also be
+ * materializes the new branch inside the worktree. It happens to also be
  * simpler than special-casing phase 1: the same detach-then-create sequence
  * works whether parentRef is trunk or a stacked phase branch.
+ *
+ * For the graphite path this means plain `git checkout -b` + `gt track
+ * --parent`, NOT `gt create --onto` -- verified directly against a real
+ * failure: `gt create` requires the current worktree to already be on some
+ * real branch and fails with "Cannot perform this operation without a
+ * branch checked out" from a detached HEAD, regardless of --onto (the
+ * detach is the whole point, so `gt create` can never be used directly
+ * here). `gt track --parent <ref>` only touches Graphite's own metadata db,
+ * so it works even while <ref> is checked out live in a different worktree
+ * -- verified directly against that exact scenario too.
  */
 export async function createPhaseWorktree(input: CreatePhaseWorktreeInput): Promise<PhaseWorktree> {
   // Computed here, not by the caller: it depends on os.homedir(), which is
@@ -106,19 +129,24 @@ export async function createPhaseWorktree(input: CreatePhaseWorktreeInput): Prom
 
   if (await pathExists(worktreePath)) {
     const currentBranch = (await git(["branch", "--show-current"], { cwd: worktreePath })).trim();
-    if (currentBranch === input.newBranchName) {
+    const onExpectedBranch = currentBranch === input.newBranchName;
+    // For graphite, being on the right branch isn't enough on its own -- an
+    // interrupted earlier attempt could have completed `git checkout -b`
+    // but died before the following `gt track` call, leaving a branch
+    // that's real but unknown to Graphite's stack metadata.
+    const reusable = onExpectedBranch && (input.stackTool !== "graphite" || (await isTrackedByGraphite(worktreePath)));
+    if (reusable) {
       const sha = (await git(["rev-parse", "HEAD"], { cwd: worktreePath })).trim();
       return { worktreePath, branch: input.newBranchName, initialCommitSha: sha };
     }
-    // Not on the expected branch -- a partial worktree left behind by an
-    // interrupted earlier attempt (an activity retry after `gt create`/
-    // `git checkout -b` failed partway, or a killed worker), verified via a
-    // real repro: reusing it as-is hands back a worktree with no real
-    // branch checked out, which then fails opaquely much later at
-    // commitWorktreeChanges ("Cannot perform this operation without a
-    // branch checked out" from gt, deterministically, on every retry).
-    // Tear it down and fall through to recreate it properly rather than
-    // trusting whatever state it was left in.
+    // A partial worktree left behind by an interrupted earlier attempt (an
+    // activity retry after `gt track`/`git checkout -b` failed partway, or a
+    // killed worker) -- verified via a real repro: reusing a branchless one
+    // as-is fails opaquely much later at commitWorktreeChanges ("Cannot
+    // perform this operation without a branch checked out" from gt,
+    // deterministically, on every retry). Tear it down and fall through to
+    // recreate it properly rather than trusting whatever state it was left
+    // in.
     await removeWorktree(input.repo, worktreePath);
   }
 
@@ -127,16 +155,28 @@ export async function createPhaseWorktree(input: CreatePhaseWorktreeInput): Prom
 
   if (input.stackTool === "graphite") {
     await ensureGraphiteInitialized(input.repo, worktreePath);
-    // "If your working directory contains no changes, an empty branch will
-    // be created" -- gt create's own documented behavior, giving every
-    // phase branch a distinguishing commit before the agent ever runs.
-    await gt(["create", input.newBranchName, "--onto", input.parentRef, "--no-interactive", "--quiet"], worktreePath);
-  } else {
-    await git(["checkout", "-b", input.newBranchName], { cwd: worktreePath });
-    // Plain git has no equivalent auto-empty-commit behavior -- create one
-    // explicitly so both stack tools give every phase branch the same
-    // "always has its own commit to amend" invariant.
-    await git(["commit", "--allow-empty", "-m", `Start phase branch ${input.newBranchName}`], { cwd: worktreePath });
+  }
+
+  // Same for both stack tools: an explicit empty commit gives every phase
+  // branch a distinguishing commit of its own (distinct from parentRef)
+  // before the agent ever runs, which is what `gt create` would otherwise
+  // have given us for free -- see the doc comment above for why `gt
+  // create` itself can't be used here.
+  //
+  // -B, not -b: removeWorktree (above) only tears down the working
+  // directory, not the branch ref itself -- if an interrupted earlier
+  // attempt got as far as creating newBranchName before dying, the ref is
+  // still there (just unchecked-out), and plain -b would fail with "a
+  // branch named ... already exists". -B resets it to the fresh detached
+  // HEAD instead, which is exactly what recreating-from-scratch means here.
+  await git(["checkout", "-B", input.newBranchName], { cwd: worktreePath });
+  await git(["commit", "--allow-empty", "-m", `Start phase branch ${input.newBranchName}`], { cwd: worktreePath });
+
+  if (input.stackTool === "graphite") {
+    // Registers the branch into Graphite's own stack metadata with the
+    // correct parent -- distinct from git's ref/commit graph, which has no
+    // notion of "parent branch" at all.
+    await gt(["track", "--parent", input.parentRef, "--no-interactive", "--quiet"], worktreePath);
   }
 
   const initialCommitSha = (await git(["rev-parse", "HEAD"], { cwd: worktreePath })).trim();

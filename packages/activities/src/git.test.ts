@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import { test } from "node:test";
 import type { RegisteredRepo } from "@issue-pipeline/core";
-import { createPhaseWorktree } from "./git";
+import { createPhaseWorktree, commitWorktreeChanges } from "./git";
 import { runCommand } from "./exec";
 
 /** stack_tool: "git" throughout -- exercises createPhaseWorktree without
@@ -120,6 +120,137 @@ test("createPhaseWorktree recreates a stale worktree left detached by an interru
       assert.equal(worktree.branch, "pipe-3-p1-test");
       const after = await runCommand("git", ["branch", "--show-current"], { cwd: worktree.worktreePath });
       assert.equal(after.stdout.trim(), "pipe-3-p1-test");
+    } finally {
+      await cleanupWorktreeHome(repo);
+    }
+  });
+});
+
+/** stack_tool: "graphite" below -- gt is a real local dependency of this
+ * package already (README lists it as a prerequisite for running the
+ * pipeline at all), and none of init/checkout/track/modify need auth or
+ * network, only `gt submit` does -- so these run offline same as the git
+ * ones above. */
+
+test("createPhaseWorktree with stackTool graphite creates a branch that commitWorktreeChanges can commit to", async () => {
+  await withSeedRepo(async (bare) => {
+    const repo = testRepo(bare);
+    try {
+      const worktree = await createPhaseWorktree({
+        repo,
+        rootIssueNumber: 10,
+        phase: 1,
+        parentRef: "main",
+        newBranchName: "pipe-10-p1-test",
+        stackTool: "graphite",
+      });
+      assert.equal(worktree.branch, "pipe-10-p1-test");
+
+      await fs.writeFile(path.join(worktree.worktreePath, "file.txt"), "hello", "utf8");
+      const result = await commitWorktreeChanges({
+        worktreePath: worktree.worktreePath,
+        stackTool: "graphite",
+        message: "test commit",
+      });
+      assert.equal(result.committed, true);
+    } finally {
+      await cleanupWorktreeHome(repo);
+    }
+  });
+});
+
+test("createPhaseWorktree with stackTool graphite reuses an existing tracked worktree on the expected branch", async () => {
+  await withSeedRepo(async (bare) => {
+    const repo = testRepo(bare);
+    try {
+      const input = {
+        repo,
+        rootIssueNumber: 11,
+        phase: 1,
+        parentRef: "main",
+        newBranchName: "pipe-11-p1-test",
+        stackTool: "graphite" as const,
+      };
+      const first = await createPhaseWorktree(input);
+      const second = await createPhaseWorktree(input);
+      assert.deepEqual(second, first);
+    } finally {
+      await cleanupWorktreeHome(repo);
+    }
+  });
+});
+
+test("createPhaseWorktree with stackTool graphite recreates a worktree that's on the right branch but was never gt track'd", async () => {
+  await withSeedRepo(async (bare) => {
+    const repo = testRepo(bare);
+    try {
+      // Simulates dying between `git checkout -b` and the following `gt
+      // track` call in createPhaseWorktree -- a real branch exists, with
+      // its own commit, but Graphite has no record of it.
+      const worktreePath = path.join(os.homedir(), "pipelines", repo.name, "phases", "12", "p1");
+      await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+      await runCommand("git", ["worktree", "add", "--detach", worktreePath, "main"], { cwd: repo.localPath });
+      await runCommand("git", ["checkout", "-b", "pipe-12-p1-test"], { cwd: worktreePath });
+      await runCommand("git", ["commit", "--allow-empty", "-m", "start"], { cwd: worktreePath });
+
+      const worktree = await createPhaseWorktree({
+        repo,
+        rootIssueNumber: 12,
+        phase: 1,
+        parentRef: "main",
+        newBranchName: "pipe-12-p1-test",
+        stackTool: "graphite",
+      });
+      assert.equal(worktree.branch, "pipe-12-p1-test");
+
+      await fs.writeFile(path.join(worktree.worktreePath, "file.txt"), "hello", "utf8");
+      const result = await commitWorktreeChanges({
+        worktreePath: worktree.worktreePath,
+        stackTool: "graphite",
+        message: "test commit after recovery",
+      });
+      // If gt track was never actually (re-)run -- the exact gap this test
+      // guards -- gt modify fails with "Cannot perform this operation on
+      // untracked branch" instead of committing.
+      assert.equal(result.committed, true);
+    } finally {
+      await cleanupWorktreeHome(repo);
+    }
+  });
+});
+
+test("createPhaseWorktree with stackTool graphite handles parentRef already checked out live in another worktree", async () => {
+  await withSeedRepo(async (bare) => {
+    const repo = testRepo(bare);
+    try {
+      // This is exactly the scenario the whole detach-first design exists
+      // for: phase 1's branch stays checked out in its own worktree while
+      // phase 2 stacks onto it.
+      const phase1 = await createPhaseWorktree({
+        repo,
+        rootIssueNumber: 20,
+        phase: 1,
+        parentRef: "main",
+        newBranchName: "pipe-20-p1-test",
+        stackTool: "graphite",
+      });
+      const phase2 = await createPhaseWorktree({
+        repo,
+        rootIssueNumber: 20,
+        phase: 2,
+        parentRef: phase1.branch,
+        newBranchName: "pipe-20-p2-test",
+        stackTool: "graphite",
+      });
+      assert.equal(phase2.branch, "pipe-20-p2-test");
+
+      await fs.writeFile(path.join(phase2.worktreePath, "file2.txt"), "hello2", "utf8");
+      const result = await commitWorktreeChanges({
+        worktreePath: phase2.worktreePath,
+        stackTool: "graphite",
+        message: "phase 2 commit",
+      });
+      assert.equal(result.committed, true);
     } finally {
       await cleanupWorktreeHome(repo);
     }
