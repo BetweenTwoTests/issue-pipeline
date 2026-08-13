@@ -8,7 +8,7 @@
     "dev": "tsx watch src/worker.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "node --import tsx --test src"
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@issue-pipeline/activities": "workspace:*",

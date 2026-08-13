@@ -8,12 +8,16 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@issue-pipeline/adapters": "workspace:*",
     "@issue-pipeline/core": "workspace:*",
     "@temporalio/activity": "1.22.0",
     "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
   }
 }
