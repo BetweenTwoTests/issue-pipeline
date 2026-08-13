@@ -12,6 +12,10 @@ bounded fixer loop → park on failure). The polling event bridge and reviewer
 role from the original design are not built yet — pipelines are started and
 un-parked via the `pipe` CLI, not GitHub comments.
 
+See [DESIGN.md](DESIGN.md) for the full architecture, the reasoning behind
+every non-obvious decision, a running list of real bugs already found and
+fixed, and a concrete roadmap for what's not built yet.
+
 ## Prerequisites
 
 - Node 24.6+, pnpm 10+, Docker
