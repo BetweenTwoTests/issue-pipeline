@@ -213,14 +213,46 @@ ${worklog.followUps}`;
   return postComment(repo, issueNumber, body);
 }
 
+// GitHub requires a label to already exist on the repo before it can be
+// added to (or removed from) an issue -- verified directly: `gh issue edit
+// --add-label`/`--remove-label` both fail with "'<label>' not found" for a
+// label that was never created on the repo. These pipeline:* labels are
+// ours; nothing else creates them, so a freshly-registered repo has none of
+// them. A fixed color makes them visually recognizable as pipeline-owned.
+const PIPELINE_LABEL_COLOR = "5319e7";
+
+async function ensureLabelExists(repo: RegisteredRepo, label: string): Promise<void> {
+  // --force updates color/description if the label already exists rather
+  // than erroring -- idempotent, safe to call unconditionally.
+  await gh(["label", "create", label, "-R", `${repo.owner}/${repo.repo}`, "--color", PIPELINE_LABEL_COLOR, "--force"]);
+}
+
 export async function addLabels(repo: RegisteredRepo, issueNumber: number, labels: string[]): Promise<void> {
   if (labels.length === 0) return;
-  await gh(["issue", "edit", String(issueNumber), "--add-label", labels.join(","), "-R", `${repo.owner}/${repo.repo}`]);
+  const target = `${repo.owner}/${repo.repo}`;
+  try {
+    await gh(["issue", "edit", String(issueNumber), "--add-label", labels.join(","), "-R", target]);
+  } catch (err) {
+    if (!(err instanceof GithubCliError) || !/not found/i.test(err.stderr)) throw err;
+    // Create whichever labels are missing, then retry once. Only reached
+    // the first time a given label is used against a given repo -- it
+    // persists on the repo after that.
+    for (const label of labels) {
+      await ensureLabelExists(repo, label);
+    }
+    await gh(["issue", "edit", String(issueNumber), "--add-label", labels.join(","), "-R", target]);
+  }
 }
 
 export async function removeLabels(repo: RegisteredRepo, issueNumber: number, labels: string[]): Promise<void> {
   if (labels.length === 0) return;
-  await gh(["issue", "edit", String(issueNumber), "--remove-label", labels.join(","), "-R", `${repo.owner}/${repo.repo}`]);
+  try {
+    await gh(["issue", "edit", String(issueNumber), "--remove-label", labels.join(","), "-R", `${repo.owner}/${repo.repo}`]);
+  } catch (err) {
+    // A label that doesn't exist on the repo at all can't be applied to the
+    // issue either -- "remove it" is vacuously satisfied, not an error.
+    if (!(err instanceof GithubCliError) || !/not found/i.test(err.stderr)) throw err;
+  }
 }
 
 export async function closeSubIssue(repo: RegisteredRepo, issueNumber: number, closingComment: string): Promise<void> {
