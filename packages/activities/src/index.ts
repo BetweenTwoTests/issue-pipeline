@@ -9,4 +9,4 @@ export * from "./agents";
 export * from "./github";
 export * from "./git";
 export * from "./gates";
-export * from "./session-index";
+export * from "./projection-db";

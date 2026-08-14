@@ -23,7 +23,7 @@ import {
   type FixerPromptInput,
 } from "@issue-pipeline/adapters";
 import { createDiscoveredTaskIssue } from "./github";
-import { appendAgentSessionRecord, defaultAgentSessionsIndexPath } from "./session-index";
+import { recordAgentSession } from "./projection-db";
 
 /**
  * Workflow code must never import @issue-pipeline/adapters directly -- doing
@@ -91,7 +91,7 @@ export async function runAgent(input: RunAgentInput): Promise<AgentResult> {
     defaultPermissionMode: DEFAULT_PERMISSION_MODE[input.role],
   });
 
-  // Observability must never fail the pipeline: the index append is
+  // Observability must never fail the pipeline: the projection write is
   // best-effort. Records are written even for crashed runs (sessionId may
   // be null then) -- a stage with three failed attempts should show three
   // entries in the viewer, not zero.
@@ -109,7 +109,7 @@ export async function runAgent(input: RunAgentInput): Promise<AgentResult> {
         costUsd: typeof result.meta?.costUsd === "number" ? result.meta.costUsd : null,
         numTurns: typeof result.meta?.numTurns === "number" ? result.meta.numTurns : null,
       };
-      await appendAgentSessionRecord(defaultAgentSessionsIndexPath(), record);
+      await recordAgentSession(record);
     } catch {
       // best-effort by design
     }

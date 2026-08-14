@@ -43,10 +43,14 @@ export function buildPlanningWorktreePath(
 }
 
 /**
- * The agent-session index (JSONL, one AgentSessionRecord per line). Lives
- * beside the worktrees, NOT inside any of them -- it must survive worktree
- * cleanup after an issue completes.
+ * The state-projection database (SQLite, via node:sqlite): pipelines,
+ * phases, events, agent_sessions. Lives beside the worktrees, NOT inside
+ * any of them (survives worktree cleanup) and NOT inside the dockerized
+ * Temporal Postgres (survives `just infra-nuke`, which is documented as
+ * the only way to lose workflow history -- analysis history shouldn't
+ * share that blast radius). Overridable via PIPELINE_DB_PATH, resolved by
+ * the callers that do I/O.
  */
-export function buildAgentSessionsIndexPath(homeDir: string): string {
-  return `${homeDir}/pipelines/agent-sessions.jsonl`;
+export function buildPipelineDbPath(homeDir: string): string {
+  return `${homeDir}/pipelines/pipeline.db`;
 }

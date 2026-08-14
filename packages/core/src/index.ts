@@ -68,9 +68,15 @@ export {
   buildPhaseBranchName,
   buildPhaseWorktreePath,
   buildPlanningWorktreePath,
-  buildAgentSessionsIndexPath,
+  buildPipelineDbPath,
   type RegisteredRepo,
 } from "./contracts/repo";
+export type {
+  PipelineEventType,
+  PipelineEvent,
+  ProjectPipelineStateInput,
+  RecordPipelineEventInput,
+} from "./contracts/projection";
 export {
   PipelineConfigSchema,
   parsePipelineConfig,

@@ -27,6 +27,7 @@ import {
   type IssueWorkflowStage,
   type PhaseProgress,
   type OpenQuestion,
+  type PipelineEventType,
   type PlannerOutput,
   type ChecklistPhase,
   type RegisteredRepo,
@@ -46,6 +47,7 @@ const {
   removeLabels,
   updateIssuePhaseChecklist,
   closeIssueCompleted,
+  projectPipelineState,
 } = quick;
 
 // The merge-wait poll hits GitHub once per open PR -- give it more headroom
@@ -84,6 +86,10 @@ const { runAgent, parsePlannerOutput } = planning;
 export interface MergeWaitResumeState {
   phases: PhaseProgress[];
   closedPrWarningPosted: boolean;
+  /** The projection-event counter continues across continue-as-new hops --
+   * the workflow ID stays the same, so a reset counter would overwrite the
+   * earlier execution's projected events. */
+  eventSeq: number;
 }
 
 export interface IssueWorkflowInput {
@@ -164,6 +170,29 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
     pendingQuestions: state.pendingQuestions.map((q) => q.q),
   }));
 
+  const repoSlug = `${input.owner}/${input.repo}`;
+
+  // Temporal's own guidance: analysis belongs in your own store, not in
+  // workflow histories. Every state transition below projects a snapshot +
+  // one event row into the local SQLite projection DB via this helper. The
+  // seq counter is workflow state (deterministic, survives replay AND
+  // continue-as-new) -- it is the idempotency key for event writes.
+  let eventSeq = input.resumeFromMergeWait?.eventSeq ?? 0;
+  const project = async (type: PipelineEventType, detail?: Record<string, unknown>): Promise<void> => {
+    eventSeq += 1;
+    await projectPipelineState({
+      workflowId: workflowInfo().workflowId,
+      repoSlug,
+      issueNumber: input.issueNumber,
+      stage: state.stage,
+      currentIndex: state.currentIndex,
+      totalPhases: state.phases.length,
+      outcome: state.stage === "done" ? "completed" : state.stage === "aborted" ? "aborted" : null,
+      phases: state.phases,
+      event: { seq: eventSeq, type, detail },
+    });
+  };
+
   const config = await loadPipelineConfig();
   const repo = await resolveRegisteredRepoBySlug(config, input.owner, input.repo);
   await ensureBareClone(repo);
@@ -178,6 +207,7 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
     // polling bridge re-finding this issue: flip the label immediately.
     await removeLabels(repo, input.issueNumber, ["pipeline:ready"]);
     await addLabels(repo, input.issueNumber, ["pipeline:in-progress"]);
+    await project("pipeline_started");
 
     // ---- Planning: Claude plan mode against a real checkout, re-run until
     // ---- a plan round comes back with zero open questions.
@@ -215,6 +245,11 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
       // to read it from the issue rather than receiving spec text from
       // Temporal.
       await postComment(repo, input.issueNumber, formatPlanComment(planningRound, decomposition));
+      await project("plan_posted", {
+        round: planningRound,
+        phases: decomposition.phases.length,
+        openQuestions: decomposition.open_questions.length,
+      });
 
       if (decomposition.open_questions.length === 0) break;
 
@@ -224,6 +259,7 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
       state.roundAnswers = [];
       await addLabels(repo, input.issueNumber, ["pipeline:needs-input"]);
       await postComment(repo, input.issueNumber, formatQuestionsComment(decomposition.open_questions));
+      await project("awaiting_answers", { round: planningRound, questions: decomposition.open_questions.length });
 
       const questions = decomposition.open_questions;
       const answeredAll = () => questions.every((_q, i) => state.roundAnswers.some((a) => a.index === i + 1));
@@ -241,7 +277,7 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
           );
         }
       }
-      if (state.aborted) return finalizeAborted(repo, input.issueNumber, state);
+      if (state.aborted) return finalizeAborted(repo, input.issueNumber, state, project);
 
       await removeLabels(repo, input.issueNumber, ["pipeline:needs-input"]);
       if (stalledLabelApplied) await removeLabels(repo, input.issueNumber, ["pipeline:stalled"]);
@@ -255,6 +291,7 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
       // Recorded on the issue so the decision survives outside Temporal --
       // executor sessions and future humans read it there.
       await postComment(repo, input.issueNumber, formatAnswersComment(pairs));
+      await project("answers_recorded", { round: planningRound });
       // Loop: re-plan with every answer so far baked in.
     }
 
@@ -270,12 +307,14 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
     }));
     state.currentIndex = 0;
     await updateIssuePhaseChecklist(repo, input.issueNumber, toChecklist(state.phases));
+    await project("executing_started", { totalPhases: state.phases.length });
 
     // ---- Sequential execution, each phase stacked on the previous one.
     let baseBranch = repo.defaultBranch;
     while (state.currentIndex < state.phases.length) {
       const phase = state.phases[state.currentIndex];
       phase.status = "running";
+      await project("phase_started", { phase: state.currentIndex + 1, retryGeneration: phase.retryGeneration });
       const childId = `${workflowInfo().workflowId}-phase-${state.currentIndex}-r${phase.retryGeneration}`;
 
       const result: PhaseWorkflowResult = await executeChild(phaseWorkflow, {
@@ -301,6 +340,7 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
       if (result.status === "done") {
         phase.status = "done";
         await updateIssuePhaseChecklist(repo, input.issueNumber, toChecklist(state.phases));
+        await project("phase_done", { phase: state.currentIndex + 1, prNumber: result.prNumber });
         baseBranch = result.headBranch;
         state.currentIndex += 1;
         continue;
@@ -310,10 +350,11 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
       phase.status = "parked";
       state.stage = "parked";
       state.decision = undefined;
+      await project("phase_parked", { phase: state.currentIndex + 1 });
 
       await condition(() => state.decision !== undefined);
 
-      if (state.decision === "abort") return finalizeAborted(repo, input.issueNumber, state);
+      if (state.decision === "abort") return finalizeAborted(repo, input.issueNumber, state, project);
 
       // Either decision means the phase is no longer stalled -- phaseWorkflow's
       // park() applied this label to the root issue, so issueWorkflow (the only
@@ -322,13 +363,14 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
 
       if (state.decision === "skip") {
         phase.status = "skipped";
+        state.stage = "executing";
         await updateIssuePhaseChecklist(repo, input.issueNumber, toChecklist(state.phases));
+        await project("phase_skipped", { phase: state.currentIndex + 1 });
         // The branch exists (with at least its initial commit) even for a
         // failed phase -- later phases still stack on it so their diffs
         // stay scoped to their own work.
         baseBranch = result.headBranch;
         state.currentIndex += 1;
-        state.stage = "executing";
         continue;
       }
 
@@ -336,6 +378,7 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
       phase.retryGeneration += 1;
       phase.status = "pending";
       state.stage = "executing";
+      await project("phase_resumed", { phase: state.currentIndex + 1, retryGeneration: phase.retryGeneration });
     }
 
     await postComment(
@@ -348,10 +391,15 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
   // ---- All phases shipped. The workflow is deliberately NOT done: watch
   // ---- the stack until every phase PR is merged, then close the issue.
   state.stage = "awaiting_merge";
+  if (!input.resumeFromMergeWait) {
+    await project("merge_wait_started", {
+      prNumbers: state.phases.filter((p) => p.prNumber !== null).map((p) => p.prNumber),
+    });
+  }
   const pollMs = Math.round(config.policy.merge_poll_minutes * 60_000);
 
   for (;;) {
-    if (state.aborted) return finalizeAborted(repo, input.issueNumber, state);
+    if (state.aborted) return finalizeAborted(repo, input.issueNumber, state, project);
 
     const trackedPrNumbers = state.phases
       .filter((p) => p.status === "done" && p.prNumber !== null)
@@ -368,6 +416,7 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
         `${closedUnmerged.map((s) => `PR #${s.number}`).join(", ")} was closed without merging. ` +
           "The pipeline keeps watching -- reopen the PR(s) to let this issue complete, or `pipe abort` to stop tracking.",
       );
+      await project("pr_closed_warning", { prNumbers: closedUnmerged.map((s) => s.number) });
     }
 
     // The poll loop is the one place history grows without bound (a stack
@@ -379,7 +428,7 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
         owner: input.owner,
         repo: input.repo,
         issueNumber: input.issueNumber,
-        resumeFromMergeWait: { phases: state.phases, closedPrWarningPosted },
+        resumeFromMergeWait: { phases: state.phases, closedPrWarningPosted, eventSeq },
       });
     }
 
@@ -394,9 +443,12 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
   await closeIssueCompleted(repo, input.issueNumber, formatFinalSummary(state.phases));
   await cleanupIssueWorktrees(repo, input.issueNumber, state.phases.length);
 
+  const mergedPrs = state.phases.filter((p) => p.status === "done" && p.prNumber !== null).length;
+  await project("pipeline_completed", { mergedPrs });
+
   return {
     outcome: "completed",
-    mergedPrs: state.phases.filter((p) => p.status === "done" && p.prNumber !== null).length,
+    mergedPrs,
     totalPhases: state.phases.length,
   };
 }
@@ -405,10 +457,12 @@ async function finalizeAborted(
   repo: RegisteredRepo,
   issueNumber: number,
   state: IssueState,
+  project: (type: PipelineEventType, detail?: Record<string, unknown>) => Promise<void>,
 ): Promise<IssueWorkflowResult> {
   state.stage = "aborted";
   await postComment(repo, issueNumber, "Pipeline aborted by human command.");
   await removeLabels(repo, issueNumber, ["pipeline:in-progress"]);
+  await project("pipeline_aborted");
   return {
     outcome: "aborted",
     mergedPrs: 0,

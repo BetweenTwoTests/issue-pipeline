@@ -78,6 +78,7 @@ test("issueWorkflow: an abort signal while awaiting answers ends the pipeline (e
       buildPlannerPrompt: async () => "planner prompt",
       runAgent: async () => ({ ok: true, summary: QUESTION_PLANNER_JSON, deviations: [], artifacts: [] }),
       parsePlannerOutput, // real implementation -- pure, no I/O, no need to mock
+      projectPipelineState: async () => {},
       postComment: async (_repo: unknown, _issueNumber: number, body: string) => {
         posted.push(body);
       },
@@ -130,6 +131,7 @@ test("issueWorkflow: plans, executes the phase, waits for the PR to merge, then 
     getPullRequestStates: 0,
     fileDiscoveredTasks: [] as string[],
     executorRuns: 0,
+    projectedEvents: [] as string[],
   };
 
   const worker = await Worker.create({
@@ -157,6 +159,12 @@ test("issueWorkflow: plans, executes the phase, waits for the PR to merge, then 
         return { ok: true, summary: "did it", deviations: [], artifacts: [] };
       },
       parsePlannerOutput, // real implementation
+      projectPipelineState: async (input: { event: { type: string } }) => {
+        calls.projectedEvents.push(input.event.type);
+      },
+      recordPipelineEvent: async (input: { event: { type: string } }) => {
+        calls.projectedEvents.push(input.event.type);
+      },
       postComment: async (_repo: unknown, _issueNumber: number, body: string) => {
         posted.push(body);
       },
@@ -237,6 +245,20 @@ test("issueWorkflow: plans, executes the phase, waits for the PR to merge, then 
       posted.some((body) => body.includes("All phases executed")),
       "expected the merge-wait comment to have been posted",
     );
+    // The projection saw the whole lifecycle, in order, from both workflows.
+    for (const expected of [
+      "pipeline_started",
+      "plan_posted",
+      "executing_started",
+      "phase_started",
+      "attempt_started",
+      "attempt_finished",
+      "phase_done",
+      "merge_wait_started",
+      "pipeline_completed",
+    ]) {
+      assert.ok(calls.projectedEvents.includes(expected), `expected projected event ${expected}`);
+    }
     // The final summary rides on the CLOSING comment (gh issue close -c),
     // not a separate postComment.
     assert.ok(

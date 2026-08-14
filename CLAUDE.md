@@ -87,7 +87,9 @@ discovered-task sub-issues), `git.ts` (bare clone / worktrees / submit),
 `agents.ts` (the `runAgent` dispatcher — Claude only — plus the WORKLOG.md
 and planner-JSON contract parsers and discovered-task filing), `gates.ts`
 (advisory test/lint/build commands), `config.ts` (pipeline.yaml loading +
-repo resolution). `packages/adapters` is the CLI-shelling layer underneath
+repo resolution), `projection-db.ts` (the SQLite state-projection store at
+`~/pipelines/pipeline.db` — Temporal state projected out for analysis; both
+workflows call it at every transition, writes are best-effort by design). `packages/adapters` is the CLI-shelling layer underneath
 `agents.ts` (`claude.ts` only, plus the prompt templates) — activities never
 shell out to an agent directly, they go through the adapter.
 

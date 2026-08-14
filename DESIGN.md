@@ -431,7 +431,50 @@ mode this layer exists to prevent:
   would kill a legitimately-still-running multi-minute agent process for
   "missing heartbeat" regardless of actual progress.
 
-## 10. Session transcripts & the viewer (apps/viewer)
+## 10. State projection, session transcripts & the viewer (apps/viewer)
+
+**Decision: project workflow state into a local SQLite DB, per Temporal's
+own guidance.** Temporal is deliberately not a queryable analysis store —
+histories are the execution record, Visibility is for finding executions,
+and anything analytical ("cost per issue", "how long did phase 2 sit
+parked", "how often do fixers fire") belongs in a datastore you own.
+`issueWorkflow` and `phaseWorkflow` therefore call a projection activity at
+every state transition, writing to **`~/pipelines/pipeline.db`**
+(`PIPELINE_DB_PATH` overrides; path helper in core, writer in
+`activities/src/projection-db.ts`):
+
+- `pipelines` — one row per issue workflow (the entity): stage,
+  current/total phases, outcome, started/updated timestamps. Upserted by
+  `projectPipelineState` with a full snapshot each call.
+- `phases` — per-phase status/branch/PR, replaced wholesale from the same
+  snapshot (simple, and self-heals from any drift).
+- `events` — append-only transition log. `issueWorkflow` emits lifecycle
+  events (plan rounds, awaiting/recorded answers, phase
+  started/done/parked/skipped/resumed, merge-wait, completion/abort);
+  `phaseWorkflow` children emit per-attempt events (started/finished with
+  the failure-reason outcome). **Idempotency**: the event key is
+  (source workflow id, seq) where seq is a monotonic counter kept in
+  workflow state — deterministic under replay, carried across
+  continue-as-new (same workflow id!), and INSERT OR REPLACE makes
+  at-least-once activity retries harmless. Child events carry the entity's
+  workflow id in a separate grouping column.
+- `agent_sessions` — one row per `runAgent` call (written in-process by the
+  activity, not a separate activity): role, phase, attempt, Claude Code
+  session id, cost, turns, start/finish. Recorded even for crashed runs
+  (session id null) so a stage with three failed attempts shows three rows;
+  deduped by a partial unique index on session id.
+
+Why SQLite and not the Postgres already running for Temporal: the
+projection must outlive the infra (`just infra-nuke` deletes that Postgres
+volume — analysis history shouldn't share workflow history's blast radius),
+must be readable with docker down, and `node:sqlite` ships in Node 24 —
+zero dependencies, zero migrations tooling, WAL mode for concurrent
+reader/writer. Verified working on this machine (it still prints an
+ExperimentalWarning — log noise, not observed instability). All projection
+writes are **best-effort**: the activity wrappers swallow their own errors
+(console.warn) because observability must never fail a pipeline. The whole
+DB is a disposable read model — deleting it loses analysis history, never
+correctness (Temporal + the GitHub issue remain the sources of truth).
 
 **Decision: reuse Claude Code's own session store instead of capturing
 transcripts ourselves.** Every `claude -p` invocation already persists its
@@ -442,26 +485,20 @@ cwd with `/`, `.`, etc. munged to `-`). Capturing a second copy (e.g. via
 `--output-format stream-json`) would duplicate megabytes per session and
 touch the battle-tested adapter for no information gain. Transcripts are
 also far too big for GitHub comments (65k char limit), so they stay local
-by design — GitHub carries the *pointers*.
-
-What the pipeline adds is the mapping layer:
-- **`~/pipelines/agent-sessions.jsonl`** (path helper in core, writer in
-  `activities/src/session-index.ts`): one `AgentSessionRecord` line per
-  `runAgent` call — repo/issue/phase/role/attempt, workflowId, sessionId,
-  cwd, ok, cost, turns. Written **best-effort** (a failed append never fails
-  the phase) and written even for crashed runs (sessionId null) so a stage
-  with three failed attempts shows three rows, not zero. Lives beside the
-  worktrees, not in one, so it survives worktree cleanup.
-- **Worklog comments carry a session footer** (`_Agent session `<id>` ·
-  $0.42 · 12 turns_`) so the issue page links each phase to its transcript.
+by design — GitHub carries the *pointers*: worklog comments include a
+session footer (`_Agent session `<id>` · $0.42 · 12 turns_`), and
+`agent_sessions` maps stage → session id for tooling.
 
 **The viewer** (`just viewer`, http://127.0.0.1:8844) is a zero-dependency
 `node:http` server + single embedded HTML page (no build assets to copy, no
-CDN). `apps/viewer` → core only — it reads local files and never talks to
-Temporal. Sessions come from the index, plus a **discovery sweep** over the
-session store for pipeline-shaped dir names (`...-pipelines-<repo>-phases-
-<n>-p<k>` / `-planning` / the legacy `--repo` planner cwd) so pre-index
-sessions and index-write failures still show up, labeled "unindexed".
+CDN). `apps/viewer` → core only — it reads the projection DB (read-only,
+per-request opens) and Claude Code's session store; it never talks to
+Temporal. It renders each pipeline's stage/phases/cost with its projected
+event timeline, plus every session's full transcript. Sessions come from
+`agent_sessions`, plus a **discovery sweep** over the session store for
+pipeline-shaped dir names (`...-pipelines-<repo>-phases-<n>-p<k>` /
+`-planning` / the legacy `--repo` planner cwd) so pre-projection sessions
+and projection-write failures still show up, labeled "unindexed".
 
 Hard-won details baked into it:
 - The transcript format is Claude Code's **internal** storage, not an API —

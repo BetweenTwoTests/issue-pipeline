@@ -1,12 +1,19 @@
-import { proxyActivities } from "@temporalio/workflow";
-import { buildPhaseBranchName, type RegisteredRepo, type PipelineConfig } from "@issue-pipeline/core";
+import { proxyActivities, workflowInfo } from "@temporalio/workflow";
+import {
+  buildPhaseBranchName,
+  issueWorkflowId,
+  type PipelineEventType,
+  type RegisteredRepo,
+  type PipelineConfig,
+} from "@issue-pipeline/core";
 import type * as activities from "@issue-pipeline/activities";
 
 const quick = proxyActivities<typeof activities>({
   startToCloseTimeout: "30s",
   retry: { maximumAttempts: 3 },
 });
-const { loadPipelineConfig, resolveRegisteredRepoBySlug, postComment, addLabels, setPullRequestBody } = quick;
+const { loadPipelineConfig, resolveRegisteredRepoBySlug, postComment, addLabels, setPullRequestBody, recordPipelineEvent } =
+  quick;
 
 // GitHub round-trips that may involve several gh calls each (sub-issue
 // listing + creation, worklog comment posting).
@@ -110,6 +117,20 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
   let lastPr: { url: string; number: number } | null = null;
   const maxFixAttempts = config.policy.max_fix_attempts;
 
+  // Attempt-level projection events, grouped under the ENTITY workflow's id
+  // (derivable from owner/repo/issue -- pure) but keyed/deduped by this
+  // child execution's own id and counter.
+  const pipelineWorkflowId = issueWorkflowId(input.owner, input.repo, input.issueNumber);
+  let eventSeq = 0;
+  const emit = async (type: PipelineEventType, detail: Record<string, unknown>): Promise<void> => {
+    eventSeq += 1;
+    await recordPipelineEvent({
+      pipelineWorkflowId,
+      sourceWorkflowId: workflowInfo().workflowId,
+      event: { seq: eventSeq, type, detail },
+    });
+  };
+
   // attempt 0 = the initial executor run; attempts 1..maxFixAttempts = fixer runs.
   for (let attempt = 0; attempt <= maxFixAttempts; attempt++) {
     if (attempt > 0) {
@@ -142,6 +163,7 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
             maxAttempts: maxFixAttempts,
           });
 
+    await emit("attempt_started", { phase: phaseNumber, attempt, role: attempt === 0 ? "executor" : "fixer" });
     const agentResult = await runAgent({
       role: attempt === 0 ? "executor" : "fixer",
       prompt,
@@ -156,6 +178,7 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
     });
 
     if (!agentResult.ok) {
+      await emit("attempt_finished", { phase: phaseNumber, attempt, outcome: "agent_crashed" });
       priorFailure = { reason: "agent_crashed", detail: agentResult.summary };
       if (attempt === maxFixAttempts) {
         return park(repo, config, input, worktree.branch, lastPr, "agent_crashed", agentResult.summary);
@@ -168,6 +191,7 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
       worklog = await readAndClearWorklog(worktree.worktreePath);
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
+      await emit("attempt_finished", { phase: phaseNumber, attempt, outcome: "worklog_contract_violation" });
       priorFailure = { reason: "worklog_contract_violation", detail };
       if (attempt === maxFixAttempts) {
         return park(repo, config, input, worktree.branch, lastPr, "worklog_contract_violation", detail);
@@ -212,6 +236,7 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
     await setPullRequestBody(repo, pr.number, formatPrBody(worklog, gateResult));
 
     if (worklog.status === "blocked") {
+      await emit("attempt_finished", { phase: phaseNumber, attempt, outcome: "declared_blocked", prNumber: pr.number });
       priorFailure = { reason: "declared_blocked", detail: worklog.followUps };
       if (attempt === maxFixAttempts) {
         return park(repo, config, input, worktree.branch, lastPr, "declared_blocked", worklog.followUps);
@@ -225,6 +250,7 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
         .filter((r) => !r.ok)
         .map((r) => `${r.name}: ${r.output.slice(0, 500)}`)
         .join("\n\n");
+      await emit("attempt_finished", { phase: phaseNumber, attempt, outcome: "gate_failure", prNumber: pr.number });
       priorFailure = { reason: "gate_failure", detail };
       if (attempt === maxFixAttempts) {
         return park(repo, config, input, worktree.branch, lastPr, "gate_failure", detail);
@@ -232,6 +258,7 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
       continue;
     }
 
+    await emit("attempt_finished", { phase: phaseNumber, attempt, outcome: "done", prNumber: pr.number });
     return { status: "done", headBranch: worktree.branch, prNumber: pr.number, prUrl: pr.url };
   }
 

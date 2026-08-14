@@ -59,6 +59,7 @@ test("phaseWorkflow: retries exactly max_fix_attempts times then parks when the 
     activities: {
       loadPipelineConfig: async () => baseConfig(1),
       resolveRegisteredRepoBySlug: async () => FAKE_REPO,
+      recordPipelineEvent: async () => {},
       createPhaseWorktree: async () => ({
         worktreePath: "/tmp/fake-worktree",
         branch: "pipe/1/p1-do-thing",
@@ -136,6 +137,7 @@ test("phaseWorkflow: posts the worklog, files discovered tasks, submits the PR, 
     activities: {
       loadPipelineConfig: async () => baseConfig(2),
       resolveRegisteredRepoBySlug: async () => FAKE_REPO,
+      recordPipelineEvent: async () => {},
       createPhaseWorktree: async () => ({
         worktreePath: "/tmp/fake-worktree",
         branch: "pipe/1/p1-do-thing",

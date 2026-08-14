@@ -117,28 +117,50 @@ Progress is visible in the Temporal UI (workflow history, and the executor's
 last output line via heartbeat) and on the GitHub issue itself (checklist,
 comments, labels).
 
+## Pipeline state projection (the analysis DB)
+
+Per Temporal's own guidance — workflow histories are the execution record,
+analysis belongs in your own datastore — both workflows project every state
+transition into a local SQLite database at `~/pipelines/pipeline.db`
+(Node's built-in `node:sqlite`, no server, no dependency;
+`PIPELINE_DB_PATH` overrides the location). Tables:
+
+- `pipelines` — one row per issue: stage, phase progress, outcome, timestamps
+- `phases` — per-phase status / branch / PR
+- `events` — append-only transition log (plan rounds, answers, phase
+  starts/parks/skips/resumes, per-attempt outcomes, merge-wait, completion)
+- `agent_sessions` — one row per Claude session: role, phase, attempt,
+  Claude Code session id, cost, turns, duration
+
+It's a disposable read model: deleting the file loses analysis history,
+never pipeline correctness (Temporal + the GitHub issue stay the sources of
+truth). Query it with anything that speaks SQLite, e.g. cost per issue:
+
+```bash
+sqlite3 ~/pipelines/pipeline.db "SELECT repo_slug, issue_number, ROUND(SUM(cost_usd),2) AS usd, COUNT(*) AS sessions FROM agent_sessions GROUP BY 1,2 ORDER BY usd DESC"
+```
+
 ## Viewing agent session transcripts
 
 Every planner/executor/fixer run is a real `claude -p` session, and Claude
 Code itself already stores the full transcript — every message, tool call,
 and result — in its session store
-(`~/.claude/projects/<cwd-derived-dir>/<session-id>.jsonl`). The pipeline
-adds the mapping layer: each run appends a line to
-`~/pipelines/agent-sessions.jsonl` (repo, issue, phase, role, attempt,
-session id, cost, turns), and each phase's worklog comment on the issue
-carries its session id and cost.
+(`~/.claude/projects/<cwd-derived-dir>/<session-id>.jsonl`). The projection
+DB's `agent_sessions` table maps each pipeline stage to its session id, and
+each phase's worklog comment on the issue carries the id and cost too.
 
 ```bash
-just viewer   # read-only transcript UI at http://127.0.0.1:8844
+just viewer   # read-only UI at http://127.0.0.1:8844
 ```
 
-The viewer lists sessions grouped by repo/issue with role + phase/attempt
-badges, and renders the full transcript (prompt, Claude's messages, thinking,
-collapsible tool calls/results). It live-tails sessions that are still
-running. Sessions from before the index existed (or whose index write
-failed) are discovered by scanning the session store for pipeline-shaped
-worktree paths and shown as "unindexed". Localhost-only by design —
-transcripts contain source code and issue text.
+The viewer shows each pipeline (stage, phase progress, total cost) with its
+projected event timeline, and every session grouped by repo/issue with
+role + phase/attempt badges. Clicking a session renders the full transcript
+(prompt, Claude's messages, thinking, collapsible tool calls/results) and
+live-tails sessions that are still running. Transcripts from before the
+projection DB existed are discovered by scanning the session store for
+pipeline-shaped worktree paths and shown as "unindexed". Localhost-only by
+design — transcripts contain source code and issue text.
 
 To re-open a session interactively instead of viewing it, run
 `claude --resume <session-id>` from that session's worktree directory

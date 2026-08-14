@@ -29,6 +29,13 @@ export function renderPage(): string {
   #sidebar h1 span { color: var(--dim); font-weight: 400; }
   .group-h { padding: 10px 16px 4px; font-size: 11px; text-transform: uppercase;
              letter-spacing: .08em; color: var(--dim); }
+  .group-h .stage { color: var(--accent); }
+  .tl-row { display: flex; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--border);
+            font-family: var(--mono); font-size: 12.5px; align-items: baseline; }
+  .tl-time { color: var(--dim); flex: none; width: 150px; }
+  .tl-type { color: var(--fixer); font-weight: 700; flex: none; width: 190px; }
+  .tl-detail { color: var(--text); word-break: break-word; }
+  .tl-src { color: var(--dim); font-size: 11px; }
   .sess { display: block; width: 100%; text-align: left; border: 0; cursor: pointer;
           background: transparent; color: var(--text); padding: 8px 16px;
           border-left: 3px solid transparent; font: inherit; }
@@ -80,13 +87,13 @@ export function renderPage(): string {
   <div id="list"></div>
 </nav>
 <section id="main">
-  <div id="empty">Select a session. Sessions appear here as the pipeline runs
-    (indexed in <code>~/pipelines/agent-sessions.jsonl</code>, transcripts read
-    from Claude Code's own store).</div>
+  <div id="empty">Select a pipeline timeline or a session. Rows appear as
+    pipelines run (state projected to <code>~/pipelines/pipeline.db</code>,
+    transcripts read from Claude Code's own store).</div>
 </section>
 <script>
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const state = { sessions: [], selected: null, live: true, renderedRawLength: null };
+const state = { sessions: [], pipelines: [], selected: null, live: true, renderedRawLength: null };
 
 function fmtTime(iso) {
   if (!iso) return "";
@@ -105,18 +112,38 @@ function stageLabel(s) {
 }
 
 async function refreshSessions() {
-  const res = await fetch("/api/sessions");
-  const data = await res.json();
-  state.sessions = data.sessions;
+  const [sessRes, pipeRes] = await Promise.all([fetch("/api/sessions"), fetch("/api/pipelines")]);
+  const sessData = await sessRes.json();
+  const pipeData = await pipeRes.json();
+  state.sessions = sessData.sessions;
+  state.pipelines = pipeData.pipelines;
+
+  const groupKey = (repoSlug, repoName, issueNumber) =>
+    (repoSlug || repoName || "unknown repo") + (issueNumber != null ? " #" + issueNumber : "");
   const groups = new Map();
+  // Pipelines first (newest activity first), so an issue that just started
+  // planning shows up even before its first session lands.
+  for (const p of state.pipelines) groups.set(groupKey(p.repoSlug, null, p.issueNumber), []);
   for (const s of state.sessions) {
-    const key = (s.repoSlug || s.repoName || "unknown repo") + (s.issueNumber != null ? " #" + s.issueNumber : "");
+    const key = groupKey(s.repoSlug, s.repoName, s.issueNumber);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(s);
   }
+  const pipelineByKey = new Map(state.pipelines.map((p) => [groupKey(p.repoSlug, null, p.issueNumber), p]));
+
   let html = "";
   for (const [key, sessions] of groups) {
-    html += '<div class="group-h">' + esc(key) + "</div>";
+    const p = pipelineByKey.get(key);
+    const stage = p ? ' <span class="stage">— ' + esc(p.outcome || p.stage) + "</span>" : "";
+    const groupCost = p && p.totalCostUsd ? " · $" + p.totalCostUsd.toFixed(2) : "";
+    html += '<div class="group-h">' + esc(key) + stage + esc(groupCost) + "</div>";
+    if (p) {
+      const active = state.selected === "tl:" + p.workflowId ? " active" : "";
+      html += '<button class="sess' + active + '" data-wf="' + esc(p.workflowId) + '">' +
+        '<div class="row1"><span class="dot unknown"></span><span class="badge other">timeline</span>' +
+        "<span>" + p.eventCount + " events · phase " + (p.currentIndex < p.totalPhases ? p.currentIndex + 1 : p.totalPhases) +
+        "/" + p.totalPhases + "</span></div></button>";
+    }
     for (const s of sessions) {
       const ok = s.ok === null ? "unknown" : (s.ok ? "ok" : "bad");
       const cost = s.costUsd != null ? "$" + s.costUsd.toFixed(2) : "";
@@ -137,6 +164,35 @@ async function refreshSessions() {
   for (const btn of document.querySelectorAll(".sess[data-id]")) {
     btn.addEventListener("click", () => openSession(btn.getAttribute("data-id")));
   }
+  for (const btn of document.querySelectorAll(".sess[data-wf]")) {
+    btn.addEventListener("click", () => openTimeline(btn.getAttribute("data-wf")));
+  }
+}
+
+async function openTimeline(workflowId) {
+  state.selected = "tl:" + workflowId;
+  const res = await fetch("/api/events?workflowId=" + encodeURIComponent(workflowId));
+  const data = await res.json();
+  const p = state.pipelines.find((x) => x.workflowId === workflowId) || {};
+  const phases = (p.phases || [])
+    .map((ph) => ph.phaseNumber + ". " + ph.title + " — " + ph.status + (ph.prNumber ? " (PR #" + ph.prNumber + ")" : ""))
+    .join("<br>");
+  const rows = data.events
+    .map((e) => {
+      const src = e.sourceWorkflowId === workflowId ? "" : '<div class="tl-src">' + esc(e.sourceWorkflowId) + "</div>";
+      return '<div class="tl-row"><span class="tl-time">' + esc(fmtTime(e.occurredAt)) + '</span>' +
+        '<span class="tl-type">' + esc(e.type) + '</span>' +
+        '<span class="tl-detail">' + esc(e.detail ? JSON.stringify(e.detail) : "") + src + "</span></div>";
+    })
+    .join("");
+  document.getElementById("main").innerHTML =
+    '<div class="head"><h2>' + esc((p.repoSlug || "") + " #" + (p.issueNumber ?? "") + " — " + (p.outcome || p.stage || "")) +
+    '</h2><div class="meta">' + esc(workflowId) +
+    (p.totalCostUsd ? " · total $" + p.totalCostUsd.toFixed(2) : "") + "</div></div>" +
+    '<div id="events">' +
+    (phases ? '<div class="ev"><div class="label">phases</div><div class="card">' + phases + "</div></div>" : "") +
+    '<div class="ev"><div class="label">projected events (from ~/pipelines/pipeline.db)</div>' + rows + "</div></div>";
+  refreshSessions();
 }
 
 function renderEvent(ev) {
@@ -204,7 +260,7 @@ async function openSession(id, opts) {
 
 setInterval(() => {
   refreshSessions();
-  if (state.selected && state.live) {
+  if (state.selected && state.live && !String(state.selected).startsWith("tl:")) {
     const main = document.getElementById("main");
     const nearBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 200;
     const prevScroll = main.scrollTop;

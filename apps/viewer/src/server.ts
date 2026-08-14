@@ -1,5 +1,5 @@
 import * as http from "node:http";
-import { listSessions, findTranscriptPath, readTranscriptRaw, SESSION_ID_RE } from "./store";
+import { listSessions, listPipelines, listEvents, findTranscriptPath, readTranscriptRaw, SESSION_ID_RE } from "./store";
 import { parseTranscript } from "./transcript";
 import { renderPage } from "./page";
 
@@ -35,6 +35,22 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === "/api/sessions") {
       json(res, 200, { sessions: await listSessions() });
+      return;
+    }
+
+    if (url.pathname === "/api/pipelines") {
+      json(res, 200, { pipelines: await listPipelines() });
+      return;
+    }
+
+    if (url.pathname === "/api/events") {
+      const workflowId = url.searchParams.get("workflowId") ?? "";
+      // A bound SQL parameter, never a path -- length is the only guard needed.
+      if (workflowId === "" || workflowId.length > 300) {
+        json(res, 400, { error: "workflowId required" });
+        return;
+      }
+      json(res, 200, { events: await listEvents(workflowId) });
       return;
     }
 
