@@ -4,7 +4,10 @@ import { PipelineConfigError } from "./errors";
 
 const RoleConfigSchema = z
   .object({
-    adapter: z.enum(["claude", "codex"]),
+    // Claude only. Kept as an explicit enum (rather than dropping the key)
+    // so an old pipeline.yaml still naming codex fails loudly at parse time
+    // with a clear message, not silently somewhere downstream.
+    adapter: z.enum(["claude"]).default("claude"),
     args: z.array(z.string()).default([]),
     timeout_ms: z.number().int().positive().default(900_000),
     max_budget_usd: z.number().positive().optional(),
@@ -26,6 +29,10 @@ export const PipelineConfigSchema = z
         local_gates: z.enum(["advisory", "blocking"]).default("advisory"),
         max_fix_attempts: z.number().int().min(0).default(2),
         auto_continue: z.boolean().default(true),
+        // How long issueWorkflow sleeps between "are the stack's PRs merged
+        // yet" polls after all phases have shipped. Non-integer values are
+        // allowed on purpose (tests use sub-minute intervals).
+        merge_poll_minutes: z.number().positive().default(15),
       })
       .strict()
       .default({}),

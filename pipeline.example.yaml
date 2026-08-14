@@ -3,9 +3,11 @@
 # for the full schema this is validated against.
 version: 1
 
-# adapter: claude | codex, per role -- swapping is a config edit, not a
-# code change (see packages/adapters). All three roles default to claude
-# here; codex is available once its CLI is upgraded (see README).
+# Claude only -- the pipeline is deliberately single-vendor (the codex
+# adapter was removed with the single-issue redesign). `adapter: claude` is
+# the default and can be omitted; per-role args/timeouts/budgets still apply.
+# The planner runs in Claude Code plan mode (read-only); executor/fixer run
+# with bypassPermissions inside their isolated worktree.
 roles:
   planner:
     adapter: claude
@@ -27,6 +29,9 @@ policy:
   local_gates: advisory
   max_fix_attempts: 2
   auto_continue: true
+  # After all phases ship, the workflow polls the stack's PRs at this
+  # interval until every one is merged, then closes the issue.
+  merge_poll_minutes: 15
 
 branching:
   stack_tool: graphite

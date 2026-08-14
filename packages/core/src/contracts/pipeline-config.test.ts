@@ -7,8 +7,8 @@ const MINIMAL_VALID_YAML = `
 version: 1
 roles:
   planner: { adapter: claude }
-  executor: { adapter: codex }
-  fixer: { adapter: codex }
+  executor: { adapter: claude }
+  fixer: {}
 `;
 
 test("parsePipelineConfig applies defaults for every optional block", () => {
@@ -16,6 +16,7 @@ test("parsePipelineConfig applies defaults for every optional block", () => {
   assert.equal(config.policy.local_gates, "advisory");
   assert.equal(config.policy.max_fix_attempts, 2);
   assert.equal(config.policy.auto_continue, true);
+  assert.equal(config.policy.merge_poll_minutes, 15);
   assert.equal(config.branching.stack_tool, "graphite");
   assert.equal(config.branching.branch_prefix, "pipe");
   assert.equal(config.branching.remote, "origin");
@@ -24,6 +25,8 @@ test("parsePipelineConfig applies defaults for every optional block", () => {
   assert.deepEqual(config.repos, {});
   assert.equal(config.roles.planner.timeout_ms, 900_000);
   assert.deepEqual(config.roles.planner.args, []);
+  // adapter itself is defaulted: fixer above is an empty object
+  assert.equal(config.roles.fixer.adapter, "claude");
 });
 
 test("parsePipelineConfig throws PipelineConfigError on invalid YAML syntax", () => {
@@ -37,15 +40,15 @@ test("parsePipelineConfig throws PipelineConfigError when a required role is mis
   );
 });
 
-test("parsePipelineConfig throws when adapter is not one of the known values", () => {
+test("parsePipelineConfig rejects the retired codex adapter loudly", () => {
   assert.throws(
     () =>
       parsePipelineConfig(`
 version: 1
 roles:
-  planner: { adapter: gpt5 }
+  planner: { adapter: claude }
   executor: { adapter: codex }
-  fixer: { adapter: codex }
+  fixer: { adapter: claude }
 `),
     PipelineConfigError,
   );
@@ -69,13 +72,14 @@ test("parsePipelineConfig accepts a fully-specified config", () => {
   const config = parsePipelineConfig(`
 version: 1
 roles:
-  planner: { adapter: claude, args: ["--permission-mode", "plan"], timeout_ms: 600000, max_budget_usd: 2.0 }
-  executor: { adapter: codex, args: ["--full-auto"] }
-  fixer: { adapter: codex }
+  planner: { adapter: claude, args: [], timeout_ms: 600000, max_budget_usd: 2.0 }
+  executor: { adapter: claude }
+  fixer: { adapter: claude }
 policy:
   local_gates: blocking
   max_fix_attempts: 3
   auto_continue: false
+  merge_poll_minutes: 5
 branching:
   stack_tool: git
   branch_prefix: feature
@@ -92,6 +96,7 @@ repos:
     default_branch: main
 `);
   assert.equal(config.policy.local_gates, "blocking");
+  assert.equal(config.policy.merge_poll_minutes, 5);
   assert.equal(config.branching.stack_tool, "git");
   assert.equal(config.gates.commands.length, 1);
   assert.equal(config.repos["chronic-backend"]?.github, "Flagler-Health/chronic-backend");

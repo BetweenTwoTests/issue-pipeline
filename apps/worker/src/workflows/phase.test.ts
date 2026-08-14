@@ -15,10 +15,15 @@ function baseConfig(maxFixAttempts: number) {
     version: 1 as const,
     roles: {
       planner: { adapter: "claude" as const, args: [], timeout_ms: 1000 },
-      executor: { adapter: "codex" as const, args: [], timeout_ms: 1000 },
-      fixer: { adapter: "codex" as const, args: [], timeout_ms: 1000 },
+      executor: { adapter: "claude" as const, args: [], timeout_ms: 1000 },
+      fixer: { adapter: "claude" as const, args: [], timeout_ms: 1000 },
     },
-    policy: { local_gates: "advisory" as const, max_fix_attempts: maxFixAttempts, auto_continue: true },
+    policy: {
+      local_gates: "advisory" as const,
+      max_fix_attempts: maxFixAttempts,
+      auto_continue: true,
+      merge_poll_minutes: 15,
+    },
     branching: { stack_tool: "git" as const, branch_prefix: "pipe", remote: "origin", pr_draft: false },
     gates: { timeout_ms: 1000, commands: [] },
     repos: {},
@@ -30,17 +35,12 @@ const FAKE_REPO = { name: "test-repo", owner: "acme", repo: "widgets", localPath
 const BASE_INPUT: PhaseWorkflowInput = {
   owner: "acme",
   repo: "widgets",
-  planIssueNumber: 1,
+  issueNumber: 1,
   phaseIndex: 0,
   totalPhases: 1,
-  subIssueNumber: 2,
   phaseTitle: "Do the thing",
-  phaseGoal: "goal",
-  phaseSpec: "spec",
-  acceptance: ["works"],
   branchSlug: "do-thing",
   baseBranch: "main",
-  priorSubIssueNumbers: [],
 };
 
 test("phaseWorkflow: retries exactly max_fix_attempts times then parks when the agent keeps crashing", async () => {
@@ -59,8 +59,6 @@ test("phaseWorkflow: retries exactly max_fix_attempts times then parks when the 
     activities: {
       loadPipelineConfig: async () => baseConfig(1),
       resolveRegisteredRepoBySlug: async () => FAKE_REPO,
-      ensureBareClone: async () => {},
-      fetchRepo: async () => {},
       createPhaseWorktree: async () => ({
         worktreePath: "/tmp/fake-worktree",
         branch: "pipe/1/p1-do-thing",
@@ -78,16 +76,18 @@ test("phaseWorkflow: retries exactly max_fix_attempts times then parks when the 
       readAndClearWorklog: async () => {
         throw new Error("should not be reached: runAgent always fails before worklog parsing");
       },
-      postWorklogComment: async () => {},
+      postPhaseWorklogComment: async () => {
+        throw new Error("should not be reached: a crashed agent has no worklog to post");
+      },
+      fileDiscoveredTasks: async () => {
+        throw new Error("should not be reached: a crashed agent has no discovered tasks");
+      },
       runLocalGates: async () => ({ passed: true, results: [] }),
-      commitWorktreeChanges: async () => ({ committed: false }),
-      submitPullRequest: async () => {
+      commitLeftoverChanges: async () => ({ committed: false }),
+      submitPhaseBranch: async () => {
         throw new Error("should not be reached: a crashed agent never reaches PR submission");
       },
       setPullRequestBody: async () => {},
-      closeSubIssue: async () => {
-        throw new Error("should not be reached: a parked phase never closes its sub-issue");
-      },
       addLabels: async (_repo: unknown, _issueNumber: number, labels: string[]) => {
         calls.addLabels.push(labels);
       },
@@ -105,6 +105,7 @@ test("phaseWorkflow: retries exactly max_fix_attempts times then parks when the 
     )) as PhaseWorkflowResult;
 
     assert.equal(result.status, "parked");
+    assert.equal(result.prNumber, null, "no attempt got far enough to submit a PR");
     // executor attempt (0) + exactly 1 fixer attempt (max_fix_attempts: 1)
     assert.equal(calls.runAgent, 2);
     // reset happens before every attempt EXCEPT the first
@@ -115,13 +116,17 @@ test("phaseWorkflow: retries exactly max_fix_attempts times then parks when the 
   }
 });
 
-test("phaseWorkflow: closes the sub-issue and returns done when the worklog says done", async () => {
+test("phaseWorkflow: posts the worklog, files discovered tasks, submits the PR, and returns done", async () => {
   const testEnv = await TestWorkflowEnvironment.createFromExistingServer({
     address: "localhost:7833",
     namespace: "issue-pipeline",
   });
 
-  const calls = { closeSubIssue: 0, submitPullRequest: 0 };
+  const calls = {
+    submitPhaseBranch: 0,
+    postPhaseWorklogComment: 0,
+    fileDiscoveredTasks: [] as string[],
+  };
 
   const worker = await Worker.create({
     connection: testEnv.nativeConnection,
@@ -131,8 +136,6 @@ test("phaseWorkflow: closes the sub-issue and returns done when the worklog says
     activities: {
       loadPipelineConfig: async () => baseConfig(2),
       resolveRegisteredRepoBySlug: async () => FAKE_REPO,
-      ensureBareClone: async () => {},
-      fetchRepo: async () => {},
       createPhaseWorktree: async () => ({
         worktreePath: "/tmp/fake-worktree",
         branch: "pipe/1/p1-do-thing",
@@ -147,20 +150,25 @@ test("phaseWorkflow: closes the sub-issue and returns done when the worklog says
         deviationsFromSpec: "None.",
         surprisesFindings: "None.",
         followUps: "None.",
+        discoveredTasks: "- Found a flaky test elsewhere",
         status: "done" as const,
         raw: "## Done\ndid the thing\n\n## Status: done",
       }),
-      postWorklogComment: async () => {},
+      postPhaseWorklogComment: async () => {
+        calls.postPhaseWorklogComment++;
+        return { url: "https://example.com/comment" };
+      },
+      fileDiscoveredTasks: async (_repo: unknown, _issue: number, _phase: number, text: string) => {
+        calls.fileDiscoveredTasks.push(text);
+        return { created: 1, total: 1 };
+      },
       runLocalGates: async () => ({ passed: true, results: [] }),
-      commitWorktreeChanges: async () => ({ committed: true }),
-      submitPullRequest: async () => {
-        calls.submitPullRequest++;
+      commitLeftoverChanges: async () => ({ committed: true }),
+      submitPhaseBranch: async () => {
+        calls.submitPhaseBranch++;
         return { url: "https://github.com/acme/widgets/pull/1", number: 1 };
       },
       setPullRequestBody: async () => {},
-      closeSubIssue: async () => {
-        calls.closeSubIssue++;
-      },
       addLabels: async () => {},
       postComment: async () => {},
     },
@@ -177,8 +185,11 @@ test("phaseWorkflow: closes the sub-issue and returns done when the worklog says
 
     assert.equal(result.status, "done");
     assert.equal(result.headBranch, "pipe/1/p1-do-thing");
-    assert.equal(calls.closeSubIssue, 1);
-    assert.equal(calls.submitPullRequest, 1);
+    assert.equal(result.prNumber, 1);
+    assert.equal(result.prUrl, "https://github.com/acme/widgets/pull/1");
+    assert.equal(calls.submitPhaseBranch, 1);
+    assert.equal(calls.postPhaseWorklogComment, 1);
+    assert.deepEqual(calls.fileDiscoveredTasks, ["- Found a flaky test elsewhere"]);
   } finally {
     await testEnv.teardown();
   }

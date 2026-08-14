@@ -5,9 +5,9 @@ import { withPipelineHandle } from "../lib/signal-helper";
 export function registerAnswerCommand(program: Command): void {
   program
     .command("answer")
-    .description("Answer one of a pipeline's numbered blocking questions")
+    .description("Answer one of the plan's numbered open questions (all of them block implementation)")
     .argument("<issue-ref>", 'GitHub issue URL or "owner/repo#123"')
-    .argument("<index>", "1-based question number, as posted in the pipeline's comment")
+    .argument("<index>", "1-based question number, as posted in the pipeline's latest questions comment")
     .argument("<text>", "Answer text (quote it if it contains spaces)")
     .action(async (issueRefArg: string, indexArg: string, text: string) => {
       const index = Number(indexArg);

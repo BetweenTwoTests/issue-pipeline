@@ -5,13 +5,13 @@ import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import { test } from "node:test";
 import type { RegisteredRepo } from "@issue-pipeline/core";
-import { createPhaseWorktree, commitWorktreeChanges } from "./git";
+import { createPhaseWorktree, createPlanningWorktree, commitLeftoverChanges, fetchRepo } from "./git";
 import { runCommand } from "./exec";
 
-/** stack_tool: "git" throughout -- exercises createPhaseWorktree without
- * depending on the `gt` binary or Graphite auth being available in CI. */
+/** stack_tool: "git" throughout most tests -- exercises createPhaseWorktree
+ * without depending on the `gt` binary or Graphite auth being available. */
 
-async function withSeedRepo(fn: (bareLocalPath: string) => Promise<void>): Promise<void> {
+async function withSeedRepo(fn: (bareLocalPath: string, seedPath: string) => Promise<void>): Promise<void> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "issue-pipeline-git-test-"));
   const seed = path.join(dir, "seed");
   const bare = path.join(dir, "bare.git");
@@ -22,7 +22,8 @@ async function withSeedRepo(fn: (bareLocalPath: string) => Promise<void>): Promi
     await runCommand("git", ["config", "user.name", "Test"], { cwd: seed });
     await runCommand("git", ["commit", "--allow-empty", "-m", "root commit"], { cwd: seed });
     await runCommand("git", ["clone", "--bare", seed, bare]);
-    await fn(bare);
+    await runCommand("git", ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], { cwd: bare });
+    await fn(bare, seed);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
@@ -94,13 +95,13 @@ test("createPhaseWorktree recreates a stale worktree left detached by an interru
     try {
       // Simulates exactly what's left on disk when an earlier attempt got
       // as far as `git worktree add --detach` but never reached the branch
-      // checkout step -- e.g. an activity retry after a transient `gt
-      // create`/`git checkout -b` failure, or a worker restart mid-activity.
-      // Verified against a real production failure: reusing this blindly
-      // (the old behavior) silently hands back a worktree with no branch
-      // checked out, which only surfaces much later as an opaque "Cannot
-      // perform this operation without a branch checked out" from `gt
-      // modify`, deterministically, on every subsequent retry.
+      // checkout step -- e.g. an activity retry after a transient failure,
+      // or a worker restart mid-activity. Verified against a real
+      // production failure: reusing this blindly (the old behavior)
+      // silently hands back a worktree with no branch checked out, which
+      // only surfaces much later as an opaque "Cannot perform this
+      // operation without a branch checked out", deterministically, on
+      // every subsequent retry.
       const worktreePath = path.join(os.homedir(), "pipelines", repo.name, "phases", "3", "p1");
       await fs.mkdir(path.dirname(worktreePath), { recursive: true });
       await runCommand("git", ["worktree", "add", "--detach", worktreePath, "main"], { cwd: repo.localPath });
@@ -126,13 +127,80 @@ test("createPhaseWorktree recreates a stale worktree left detached by an interru
   });
 });
 
+test("commitLeftoverChanges commits dirty files as a NEW commit and no-ops on a clean tree", async () => {
+  await withSeedRepo(async (bare) => {
+    const repo = testRepo(bare);
+    try {
+      const worktree = await createPhaseWorktree({
+        repo,
+        rootIssueNumber: 4,
+        phase: 1,
+        parentRef: "main",
+        newBranchName: "pipe-4-p1-test",
+        stackTool: "git",
+      });
+
+      const clean = await commitLeftoverChanges({ worktreePath: worktree.worktreePath, message: "leftovers" });
+      assert.equal(clean.committed, false);
+
+      await fs.writeFile(path.join(worktree.worktreePath, "file.txt"), "hello", "utf8");
+      const dirty = await commitLeftoverChanges({ worktreePath: worktree.worktreePath, message: "leftovers" });
+      assert.equal(dirty.committed, true);
+
+      // A new commit on top of the initial one -- never an amend, which
+      // would rewrite a commit the agent may already have pushed.
+      const { stdout } = await runCommand("git", ["rev-parse", "HEAD~1"], { cwd: worktree.worktreePath });
+      assert.equal(stdout.trim(), worktree.initialCommitSha);
+    } finally {
+      await cleanupWorktreeHome(repo);
+    }
+  });
+});
+
+test("fetchRepo fast-forwards the bare clone's local trunk ref to origin's tip", async () => {
+  await withSeedRepo(async (bare, seed) => {
+    const repo = testRepo(bare);
+    // Advance the "remote" (seed) after the bare clone was made -- without
+    // the second fetch refspec in fetchRepo, refs/heads/main in the bare
+    // clone stays frozen at clone time and every planning worktree/phase-1
+    // branch would be cut from stale code.
+    await runCommand("git", ["commit", "--allow-empty", "-m", "upstream moved"], { cwd: seed });
+    const upstream = (await runCommand("git", ["rev-parse", "main"], { cwd: seed })).stdout.trim();
+
+    const before = (await runCommand("git", ["rev-parse", "main"], { cwd: bare })).stdout.trim();
+    assert.notEqual(before, upstream, "sanity check: bare clone starts stale");
+
+    await fetchRepo(repo);
+    const after = (await runCommand("git", ["rev-parse", "main"], { cwd: bare })).stdout.trim();
+    assert.equal(after, upstream);
+  });
+});
+
+test("createPlanningWorktree checks out a detached read-only copy at trunk and recreates cleanly", async () => {
+  await withSeedRepo(async (bare) => {
+    const repo = testRepo(bare);
+    try {
+      const first = await createPlanningWorktree(repo, 5);
+      const detached = await runCommand("git", ["branch", "--show-current"], { cwd: first.worktreePath });
+      assert.equal(detached.stdout.trim(), "", "planning worktree must be detached (it never commits)");
+
+      // Leave junk behind, then recreate -- must come back clean.
+      await fs.writeFile(path.join(first.worktreePath, "junk.txt"), "junk", "utf8");
+      const second = await createPlanningWorktree(repo, 5);
+      assert.equal(second.worktreePath, first.worktreePath);
+      await assert.rejects(() => fs.access(path.join(second.worktreePath, "junk.txt")));
+    } finally {
+      await cleanupWorktreeHome(repo);
+    }
+  });
+});
+
 /** stack_tool: "graphite" below -- gt is a real local dependency of this
  * package already (README lists it as a prerequisite for running the
- * pipeline at all), and none of init/checkout/track/modify need auth or
- * network, only `gt submit` does -- so these run offline same as the git
- * ones above. */
+ * pipeline at all), and none of init/checkout/track need auth or network,
+ * only `gt submit` does -- so these run offline same as the git ones above. */
 
-test("createPhaseWorktree with stackTool graphite creates a branch that commitWorktreeChanges can commit to", async () => {
+test("createPhaseWorktree with stackTool graphite leaves the branch tracked (gt parent resolves)", async () => {
   await withSeedRepo(async (bare) => {
     const repo = testRepo(bare);
     try {
@@ -145,14 +213,13 @@ test("createPhaseWorktree with stackTool graphite creates a branch that commitWo
         stackTool: "graphite",
       });
       assert.equal(worktree.branch, "pipe-10-p1-test");
-
-      await fs.writeFile(path.join(worktree.worktreePath, "file.txt"), "hello", "utf8");
-      const result = await commitWorktreeChanges({
-        worktreePath: worktree.worktreePath,
-        stackTool: "graphite",
-        message: "test commit",
-      });
-      assert.equal(result.committed, true);
+      // `gt parent` exits non-zero on untracked branches (verified; --quiet
+      // suppresses its stdout, so the exit code IS the signal -- same
+      // predicate production's isTrackedByGraphite uses). Resolving here
+      // proves `gt track` actually registered the branch.
+      await assert.doesNotReject(
+        runCommand("gt", ["parent", "--no-interactive", "--quiet"], { cwd: worktree.worktreePath }),
+      );
     } finally {
       await cleanupWorktreeHome(repo);
     }
@@ -203,16 +270,12 @@ test("createPhaseWorktree with stackTool graphite recreates a worktree that's on
       });
       assert.equal(worktree.branch, "pipe-12-p1-test");
 
-      await fs.writeFile(path.join(worktree.worktreePath, "file.txt"), "hello", "utf8");
-      const result = await commitWorktreeChanges({
-        worktreePath: worktree.worktreePath,
-        stackTool: "graphite",
-        message: "test commit after recovery",
-      });
       // If gt track was never actually (re-)run -- the exact gap this test
-      // guards -- gt modify fails with "Cannot perform this operation on
-      // untracked branch" instead of committing.
-      assert.equal(result.committed, true);
+      // guards -- `gt parent` exits non-zero with "Cannot perform this
+      // operation on untracked branch".
+      await assert.doesNotReject(
+        runCommand("gt", ["parent", "--no-interactive", "--quiet"], { cwd: worktree.worktreePath }),
+      );
     } finally {
       await cleanupWorktreeHome(repo);
     }
@@ -245,10 +308,9 @@ test("createPhaseWorktree with stackTool graphite handles parentRef already chec
       assert.equal(phase2.branch, "pipe-20-p2-test");
 
       await fs.writeFile(path.join(phase2.worktreePath, "file2.txt"), "hello2", "utf8");
-      const result = await commitWorktreeChanges({
+      const result = await commitLeftoverChanges({
         worktreePath: phase2.worktreePath,
-        stackTool: "graphite",
-        message: "phase 2 commit",
+        message: "phase 2 leftovers",
       });
       assert.equal(result.committed, true);
     } finally {

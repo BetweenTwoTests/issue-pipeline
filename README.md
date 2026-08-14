@@ -1,16 +1,31 @@
 # issue-pipeline
 
-Turns a GitHub issue containing a plan into a sequence of sub-issues, executes
-each phase with an AI agent in an isolated git worktree, and opens a stacked
-PR per phase. Orchestrated by Temporal; GitHub issues/sub-issues are the
-source of truth; git branches are the workspace state.
+Runs a GitHub issue end-to-end with Claude: plans it in Claude Code plan
+mode, gets human sign-off on open questions, implements each phase in an
+isolated git worktree as a stacked PR (Graphite), and keeps watching until
+the whole stack merges -- then closes the issue.
 
-Currently implements: decompose a root issue into phases (with blocking/
-non-blocking open-question handling), and run each phase end-to-end
-(worktree → executor agent → WORKLOG.md contract → advisory gates → PR →
-bounded fixer loop → park on failure). The polling event bridge and reviewer
-role from the original design are not built yet — pipelines are started and
-un-parked via the `pipe` CLI, not GitHub comments.
+One issue == one long-lived Temporal **entity workflow** (`issueWorkflow`).
+The GitHub issue itself is the persistent memory between agent sessions:
+
+- The issue **body** holds the human-written task description plus a
+  checkbox **phase checklist** the pipeline maintains (phases are task-list
+  items, *not* sub-issues).
+- The **plan** is posted as a comment (`## Implementation plan`), produced
+  by Claude plan mode against a real checkout of the repo.
+- Every open question in the plan **blocks implementation** until answered
+  via `pipe answer` (Temporal human-in-the-loop); answers are recorded as
+  comments and the plan is re-generated with them baked in.
+- Each phase runs in a **fresh Claude session** that starts by reading the
+  issue (`gh issue view <n> --comments`), implements its one phase, commits,
+  submits the PR with `gt submit`, and comments back anything it learned.
+  Its structured WORKLOG is also posted as a phase-labeled comment.
+- New out-of-scope work an agent discovers is filed **immediately as a
+  sub-issue** of the root issue (the only remaining use of sub-issues),
+  recording which phase surfaced it.
+- After the last phase, the workflow stays alive and **polls every 15
+  minutes** (configurable) until every phase PR is merged, then closes the
+  issue as completed.
 
 See [DESIGN.md](DESIGN.md) for the full architecture, the reasoning behind
 every non-obvious decision, a running list of real bugs already found and
@@ -22,14 +37,12 @@ fixed, and a concrete roadmap for what's not built yet.
 - `just` (`brew install just`)
 - `gh` CLI, authenticated (`gh auth status`) with `repo` scope
 - SSH access to GitHub (the pipeline clones target repos over SSH)
-- `claude` CLI, logged in
+- `claude` CLI (Claude Code), logged in -- the only agent this pipeline uses
 - Graphite CLI (`gt`), **with an auth token set** — `gt auth --token <token>`,
   token from https://app.graphite.com/activate. Required for the default
   `stack_tool: graphite`; without it, PR submission will fail. If you'd
   rather skip this for now, set `branching.stack_tool: git` in
   `pipeline.yaml` instead (plain `git push` + `gh pr create`, no stacking).
-- `codex` CLI — only needed if you switch a role to `adapter: codex`. Not
-  used by default right now (see "Adapters" below).
 
 ## Setup
 
@@ -68,13 +81,16 @@ just worker     # starts the Temporal worker (foreground)
 
 Or both together: `just up`. Temporal Web UI: http://localhost:8833
 
-In another terminal, use the CLI via `just pipe <args>`:
+Write the task as a GitHub issue (a human- or AI-written description of what
+you want done -- it does not need to contain a plan; planning is the
+pipeline's first step). Then, in another terminal:
 
 ```bash
-just pipe status                                    # connectivity check
 just pipe start https://github.com/my-org/my-repo/issues/123
-just pipe resume https://github.com/my-org/my-repo/issues/123
-just pipe skip   https://github.com/my-org/my-repo/issues/123
+just pipe status https://github.com/my-org/my-repo/issues/123   # live stage/phases/PRs
+just pipe check  https://github.com/my-org/my-repo/issues/123   # poll PR merge states now
+just pipe resume https://github.com/my-org/my-repo/issues/123   # retry a parked phase
+just pipe skip   https://github.com/my-org/my-repo/issues/123   # skip a parked phase
 just pipe abort  https://github.com/my-org/my-repo/issues/123
 ```
 
@@ -86,25 +102,20 @@ pnpm --filter @issue-pipeline/cli build
 node apps/cli/dist/index.js answer https://github.com/my-org/my-repo/issues/123 1 "Use Postgres"
 ```
 
-`start` kicks off `PlanWorkflow` for that root issue: fetch → decompose into
-phases → create sub-issues → run phases sequentially, each stacking its
-branch on the previous phase's. A phase that fails after its fix attempts
-are exhausted parks the whole pipeline and posts a comment on the root issue
-explaining what happened; `resume`/`skip`/`abort` unblock it. `answer`
-answers one of the plan's numbered blocking questions (posted as a comment
-when decomposition can't proceed without a decision).
+The lifecycle `start` kicks off: plan (Claude plan mode, in a read-only
+checkout) → plan posted as a comment → **every** open question answered by a
+human (`pipe answer`, plan re-generated with answers) → phase checklist
+written into the issue body → phases executed sequentially (fresh Claude
+session + worktree + stacked PR each; checkbox ticked as each finishes) →
+poll until all PRs merge → issue closed as completed.
+
+A phase that fails after its fix attempts are exhausted parks the pipeline
+and posts a comment on the issue explaining what happened;
+`resume`/`skip`/`abort` unblock it.
 
 Progress is visible in the Temporal UI (workflow history, and the executor's
-last output line via heartbeat) and as comments/labels on the GitHub issues
-themselves.
-
-## Adapters
-
-Each role (`planner`, `executor`, `fixer`) in `pipeline.yaml` maps
-independently to `claude` or `codex` — swapping is a config edit, not a code
-change. All three default to `claude`. To use `codex` for a role, first
-confirm your installed `codex` CLI is current (`codex --version`) — an
-outdated CLI can silently fail with a model-version error at the API level.
+last output line via heartbeat) and on the GitHub issue itself (checklist,
+comments, labels).
 
 ## Development
 
@@ -114,9 +125,9 @@ pnpm --filter @issue-pipeline/worker test  # one package
 ```
 
 Package layout: `packages/core` (types/schemas/signals, no I/O — safe to
-import from Temporal workflow code), `packages/adapters` (claude.ts/codex.ts
-CLI wrappers + prompt templates), `packages/activities` (GitHub/git/gates,
-the actual I/O layer), `apps/worker` (the Temporal worker + `plan.ts`/
+import from Temporal workflow code), `packages/adapters` (the claude CLI
+wrapper + prompt templates), `packages/activities` (GitHub/git/gates, the
+actual I/O layer), `apps/worker` (the Temporal worker + `issue.ts`/
 `phase.ts` workflows), `apps/cli` (the `pipe` command).
 
 ## Troubleshooting
@@ -126,6 +137,5 @@ the actual I/O layer), `apps/worker` (the Temporal worker + `plan.ts`/
   infra-nuke` wipes it (also wipes workflow history).
 - `pipe` commands fail with a missing-env error: check `.env` is present and
   `PIPELINE_CONFIG_PATH` is absolute.
-- A phase parks immediately: check the comment it posts on the root issue,
-  and the worker's own stdout (agent stdout is included in activity
-  failures).
+- A phase parks immediately: check the comment it posts on the issue, and
+  the worker's own stdout (agent stdout is included in activity failures).

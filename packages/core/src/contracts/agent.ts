@@ -1,5 +1,7 @@
 export type AgentRole = "planner" | "executor" | "fixer";
-export type AdapterName = "claude" | "codex";
+/** Claude only -- this pipeline is deliberately single-vendor now. The
+ * codex adapter was removed with the single-issue redesign; see DESIGN.md §8. */
+export type AdapterName = "claude";
 
 /**
  * The result of a single agent CLI invocation (runAgent). This answers only

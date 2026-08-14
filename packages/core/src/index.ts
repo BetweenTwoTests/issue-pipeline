@@ -7,7 +7,7 @@ export { PIPELINE_TASK_QUEUE } from "./task-queue";
 // build. See apps/worker/src/env.ts and apps/cli/src/env.ts (duplicated on
 // purpose) for the actual loader.
 
-export { PLAN_WORKFLOW_NAME, planWorkflowId } from "./workflow-names";
+export { ISSUE_WORKFLOW_NAME, issueWorkflowId } from "./workflow-names";
 
 export {
   kickoffSignal,
@@ -15,15 +15,19 @@ export {
   resumeSignal,
   skipSignal,
   abortSignal,
-  planStatusQuery,
+  checkMergesSignal,
+  issueStatusQuery,
   type KickoffPayload,
   type AnswerItem,
   type AnswersPayload,
   type ResumePayload,
   type SkipPayload,
   type AbortPayload,
-  type PlanWorkflowState,
-  type PlanStatus,
+  type CheckMergesPayload,
+  type IssueWorkflowStage,
+  type PhaseExecutionStatus,
+  type PhaseProgress,
+  type IssueStatus,
 } from "./signals";
 
 export type { AgentRole, AdapterName, AgentResult } from "./contracts/agent";
@@ -37,6 +41,7 @@ export {
   GithubCliError,
 } from "./contracts/errors";
 export {
+  PLAN_COMMENT_HEADER,
   PhasePlanItemSchema,
   OpenQuestionSchema,
   PlannerOutputSchema,
@@ -46,16 +51,17 @@ export {
   type PlannerOutput,
 } from "./contracts/planner";
 export {
-  SubIssueMetadataSchema,
-  composeMetadataComment,
-  composeSubIssueBody,
-  parseSubIssueMetadata,
-  type SubIssueMetadata,
-} from "./contracts/sub-issue-metadata";
+  PHASE_CHECKLIST_BEGIN,
+  PHASE_CHECKLIST_END,
+  renderPhaseChecklist,
+  upsertPhaseChecklist,
+  type ChecklistPhase,
+} from "./contracts/phase-checklist";
 export {
   githubSlug,
   buildPhaseBranchName,
   buildPhaseWorktreePath,
+  buildPlanningWorktreePath,
   type RegisteredRepo,
 } from "./contracts/repo";
 export {

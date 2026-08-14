@@ -9,28 +9,48 @@ and the roadmap.
 
 ## 1. What it does
 
-Turns a GitHub issue containing a plan into a sequence of sub-issues, runs
-each phase with an AI agent in an isolated git worktree, and opens a stacked
-PR per phase. GitHub issues/sub-issues are the source of truth for plan and
-progress; Temporal is the runtime; git branches are the workspace state. No
+One GitHub issue in, one merged stack out. `pipe start <issue>` spins up a
+long-lived Temporal **entity workflow** for that issue which: plans the work
+with Claude Code plan mode against a real checkout, posts the plan as an
+issue comment, blocks until a human answers every open question, writes the
+phases into the issue body as a checkbox list, executes each phase in a
+fresh Claude session inside an isolated git worktree (one stacked PR per
+phase, submitted with `gt submit`), files any newly-discovered out-of-scope
+work as sub-issues, then keeps polling until every PR in the stack is merged
+— and only then closes the issue as completed.
+
+The GitHub issue is the source of truth and the **persistent memory between
+agent sessions**; Temporal is the runtime (state machine, retries, timers,
+human-in-the-loop signals); git branches are the workspace state. No
 database beyond Temporal's own Postgres persistence store.
 
-## 2. Scope: implemented vs. deferred
+## 2. The single-issue redesign (what changed and why)
 
-| Milestone | Status |
-|---|---|
-| M0 — scaffold (Turborepo, Docker/Temporal infra, hello-world round-trip) | Done |
-| M1 — decompose (root issue → planner → sub-issues, blocking/non-blocking open questions) | Done |
-| M2 — single phase end-to-end (worktree → executor → WORKLOG.md → gates → PR) | Done |
-| M3 — sequential loop + stacking (parent loops children, Graphite/git stacking, fixer loop) | Built and live-tested. `stack_final_gate` (whole-stack CI gate before merge) is **not** built. |
-| M4 — event bridge (polling `pipeline:ready`, GitHub-comment `/approve /skip /abort /answer`) | **Not built.** Pipelines are started/un-parked via the `pipe` CLI only. |
-| M5 — reviewer role, mid-stack rework, Codex-as-executor validation | **Not built** (reviewer role); Codex adapter exists and works but isn't the default (see §8). |
+The first iteration of this system decomposed a root issue into one
+**sub-issue per phase**. That was replaced wholesale:
 
-Other things intentionally not built: the optional plan-approval gate (the
-original proposal had it off-by-default; cut to simplify PlanWorkflow's
-state machine — no functionality lost, just never exercised), `pipe repo
-add`/`pipe init` (repos are registered by hand-editing `pipeline.yaml`
-against `pipeline.example.yaml`).
+- **Phases are checkbox task-list items on the root issue's body**, not
+  sub-issues. One page shows the whole pipeline: description, plan,
+  progress, worklogs. Sub-issues scattered the story across N+1 pages and
+  duplicated content that already had to live in the plan.
+- **The root issue is what agents read and write.** Every executor session
+  starts with `gh issue view <n> --comments` and ends (when it has
+  something to say) with `gh issue comment`. Nothing about prior phases is
+  forwarded through Temporal inputs anymore — the old `phaseWorkflow`
+  fetched prior sub-issues' worklog comments to build handoff context; now
+  the session just reads the one issue. Temporal carries only small scalars
+  (titles, branch names, PR numbers).
+- **`planWorkflow` became `issueWorkflow`, an entity workflow.** The issue
+  is the entity; the workflow ID (`pipeline-<owner>-<repo>-<n>`) is its
+  address; signals (`answer`/`resume`/`skip`/`abort`/`checkMerges`) are its
+  API; a query (`status`) exposes its state; and it does not return when
+  the code ships — it lives until the stack merges or a human aborts.
+- **Claude only.** The codex adapter was deleted (see §9). The
+  `roles.<role>.adapter` key survives as a claude-only enum so an old
+  config naming codex fails loudly at parse time instead of silently
+  misbehaving.
+- **Sub-issues have exactly one remaining job**: "discovered tasks" — new,
+  out-of-scope work an agent surfaces mid-phase (see §7).
 
 ## 3. Package architecture
 
@@ -50,19 +70,23 @@ imported *values* from core (`buildPhaseBranchName`, `slugify`, the signal
 definitions) — so webpack traced the whole barrel, hit `node:path`, and
 failed with `UnhandledSchemeError: Reading from "node:path" is not handled
 by plugins`. **`tsc`/typecheck does not catch this** — it's only visible
-when the worker actually starts. The fix was to delete that function from
+when the worker actually starts (or when the workflow tests run:
+`Worker.create` there performs the same webpack bundling, which is the
+cheapest regression check for it). The fix was to delete that function from
 core entirely and duplicate a ~30-line env loader directly in
 `apps/worker/src/env.ts` and `apps/cli/src/env.ts` (they can't share it via
 activities either, since cli must never depend on activities). If you're
 tempted to add a "shared utility" to core, first ask whether it touches
 `fs`/`child_process`/`net`/`node:path` — if yes, it belongs in `activities`
-or a per-app file, never core.
+or a per-app file, never core. (The phase-checklist renderer and the prompt
+constants are in core precisely because they are pure string manipulation.)
 
 **Why cli never imports activities.** Keeps the CLI a thin, safe Temporal
 client — every real action (GitHub calls, git operations, agent execution)
 flows through Temporal so it's observable/retryable/durable. `pipe start`
 only ever calls `client.workflow.signalWithStart`; `resume`/`skip`/`abort`/
-`answer` only ever call `handle.signal(...)`.
+`answer`/`check` only ever call `handle.signal(...)`; `status <ref>` only
+`handle.query(...)`.
 
 **Module system: CommonJS, not ESM — deliberately.** Node 24's native
 TypeScript execution only *erases type annotations*; it does not transform
@@ -81,118 +105,99 @@ raw `.ts` source with `import`/`export` syntax under CommonJS will throw a
 syntax error at runtime regardless of what tsc's `module` setting says,
 since tsc isn't in the loop for a bare `node dist/index.js` invocation.
 
-## 4. The two workflows
+## 4. `issueWorkflow` (apps/worker/src/workflows/issue.ts)
 
-### `planWorkflow` (apps/worker/src/workflows/plan.ts)
+The entity workflow's stages, in order:
 
-1. Load `pipeline.yaml`, resolve the registered repo by GitHub owner/repo
-   (not by the `repos:` map key — the workflow only ever receives
-   owner/repo/issue# from the CLI).
-2. `ensureBareClone` + `fetchRepo` (idempotent — safe even if another
-   pipeline already set this repo up).
-3. Fetch the root issue, flip its label from `pipeline:ready` (if applied
-   manually — nothing in this build applies it) to `pipeline:in-progress`.
-4. Run the planner once. Partition `open_questions` by `.blocking`. Any
-   non-blocking ones get posted as an "assumptions made" comment. Any
-   blocking ones pause the workflow (`condition()` with a 72h timeout that
-   re-arms and posts a `pipeline:stalled` label + reminder comment if it
-   fires) until answered via `pipe answer` or the pipeline is aborted; then
-   the planner runs a **second** time with the answers appended to the
-   prompt, and *that* output is what gets turned into sub-issues. (If there
-   are no blocking questions, the first pass's output is final.)
-5. Create one sub-issue per phase (via `createSubIssue`, idempotent —
-   checks `listSubIssues` for an existing `{parent, phase}` match first),
-   embedding a machine-readable `<!-- pipeline: {...} -->` metadata comment
-   in the body (parsed by `parseSubIssueMetadata` in core).
-6. Sequential loop: `executeChild(phaseWorkflow, ...)` per phase, stacking
-   `baseBranch` forward to whatever branch the previous phase produced.
-   A child returning `{status: "parked"}` pauses the *parent* awaiting
-   `resume`/`skip`/`abort`. `resume` retries the same phase index as a
-   **new child workflow execution** (see `retryGeneration` below); `skip`
-   closes that phase's sub-issue as skipped and advances anyway.
+1. **Setup.** Load `pipeline.yaml`, resolve the registered repo by GitHub
+   owner/repo (not by the `repos:` map key — the workflow only ever
+   receives owner/repo/issue# from the CLI), `ensureBareClone` +
+   `fetchRepo`, fetch the root issue, flip `pipeline:ready` →
+   `pipeline:in-progress`.
+2. **Planning loop (plan mode + human-in-the-loop).** Create the planning
+   worktree (a *detached, read-only checkout of trunk* — see §6), run the
+   planner (Claude Code plan mode, §9), parse the JSON contract, post the
+   rendered plan as a comment (`## Implementation plan`, the heading the
+   executor prompt tells later sessions to look for — latest one wins).
+   If the plan has open questions: label `pipeline:needs-input`, post them
+   as a numbered comment, and **wait**. `pipe answer <ref> <n> "<text>"`
+   answers one question; a 72h `condition` timeout re-arms with a
+   `pipeline:stalled` label + reminder comment. When every question is
+   answered, the answers are posted as a comment (so the decision history
+   lives on the issue, not just in Temporal) and the planner runs again
+   with all answers so far baked into its prompt. The loop exits only when
+   a planning round produces **zero** open questions.
 
-**Decision: `phaseWorkflow` fetches its own handoff context, rather than
-`planWorkflow` forwarding it.** The parent only ever passes
-`priorSubIssueNumbers: number[]` (pointers) to each child. The child's own
-`buildExecutorPrompt` activity fetches and formats prior phases' worklog
-comments right before building the prompt. This keeps `planWorkflow`'s own
-persisted workflow state to small scalars (per the general Temporal
-guidance: don't grow per-iteration state with content that belongs in an
-external system) — if the parent forwarded growing worklog text through
-every child's start args instead, that text would transit the parent's own
-event history on every single phase, not just the one child that needs it.
+   **Decision: every open question blocks.** The old blocking/non-blocking
+   split (non-blocking questions became auto-applied "assumptions") is
+   gone. The planner is instead told to decide non-essential things itself
+   and record the decision in the phase spec — so anything it *does* ask
+   is by definition a human decision, and implementation must not start
+   past an unanswered one. One rule, no judgment call about what counts as
+   "blocking".
+3. **Checklist.** Phase records are created in workflow state and the
+   checkbox list is written into the issue body (§5). All unchecked.
+4. **Sequential execution.** For each phase: `executeChild(phaseWorkflow)`
+   with a derived child ID (`<parent>-phase-<i>-r<retryGeneration>`),
+   passing only scalars — owner/repo/issue#, phase index/title/slug, and
+   `baseBranch` (trunk for phase 1, else the previous phase's branch; this
+   is what makes the stack). A child returning `done` ticks its checkbox
+   (with the PR link) and advances. A child returning `parked` pauses the
+   parent awaiting `resume` (retry same index as a **new** child execution,
+   `retryGeneration+1` — a completed Temporal child can't be "resumed",
+   only re-started), `skip` (checkbox ticked with a "skipped by human"
+   note; the *next* phase still stacks on the skipped phase's branch so
+   every phase's diff stays scoped to its own work), or `abort`.
+5. **Merge wait.** Post one "All phases executed" comment listing the PRs,
+   then loop: read every done-phase PR's state via `gh pr view` — if all
+   `MERGED`, exit the loop; if any is `CLOSED` (gh's json state means
+   closed-*without*-merge; merged PRs report `MERGED`) post a one-time
+   warning comment and keep waiting (reopen the PR or `pipe abort`);
+   otherwise `condition(checkMerges || aborted, merge_poll_minutes)`. The
+   poll runs **before** the first wait, so a stack that merged while phases
+   were still executing closes the issue immediately. `pipe check` forces
+   an immediate poll.
 
-### `phaseWorkflow` (apps/worker/src/workflows/phase.ts)
+   **continue-as-new lives here and only here.** The merge wait is the one
+   stage with unbounded duration (a stack can sit for weeks; at 15-minute
+   polls history grows forever), so when `workflowInfo().
+   continueAsNewSuggested` fires, the workflow rolls over carrying only
+   `{phases (small scalars), closedPrWarningPosted}` and re-enters directly
+   at the merge wait. Planning/execution never continue-as-new — their
+   history is bounded by the number of phases. Deliberately NOT carried:
+   anything an agent wrote (it's on the issue), the plan (same), config
+   (re-loaded fresh each execution).
+6. **Close.** Label `pipeline:done`, remove `pipeline:in-progress`, close
+   the issue via `gh issue close --reason completed` with the final
+   summary as the closing comment, and best-effort remove the planning +
+   phase worktrees (`cleanupIssueWorktrees`). The bare clone stays.
 
-One phase, one child workflow execution, per the retry-generation counter
-described below. Loop body (`for (attempt = 0; attempt <= max_fix_attempts;
-attempt++)`):
-1. `attempt === 0`: build the **executor** prompt. `attempt > 0`: reset the
-   worktree, build the **fixer** prompt with the previous attempt's failure
-   reason baked in (`agent_crashed` | `worklog_contract_violation` |
-   `declared_blocked` | `gate_failure`).
-2. `runAgent` — the actual CLI invocation. `AgentResult.ok` answers **only**
-   "did the process exit cleanly," nothing about task success.
-3. If `!agentResult.ok`: that's `agent_crashed`, skip straight to the retry
-   decision (no worklog to read — the process never got that far).
-4. Otherwise `readAndClearWorklog` parses the required `WORKLOG.md`
-   contract. A missing file or missing section throws
-   `WorklogContractViolationError` → `worklog_contract_violation`, also
-   straight to the retry decision.
-5. Otherwise: post the worklog as a sub-issue comment, run advisory gates,
-   commit, submit/update the PR (idempotent either way), write the PR body.
-   Then branch on `worklog.status`: `"blocked"` → `declared_blocked`, retry
-   decision. `"done"` with `policy.local_gates: blocking` and a failing
-   gate → `gate_failure`, retry decision. `"done"` and gates pass (or are
-   advisory) → close the sub-issue, return `{status: "done", headBranch}`.
-6. Retry decision: `attempt === max_fix_attempts` → post a parked-comment on
-   the **root** issue (not the sub-issue — see below) with a
-   `pipeline:stalled` label, return `{status: "parked", headBranch}`.
-   Otherwise loop again (worktree gets reset first, at the top of the next
-   iteration).
-
-**`AgentResult` vs. `WorklogSections` is a deliberate, load-bearing split,
-not two representations of the same thing.** `AgentResult` (in
-`packages/core/src/contracts/agent.ts`) is the adapter's own report on
-whether the CLI process ran; `WorklogSections` (parsed by
-`readAndClearWorklog` in `packages/activities/src/agents.ts`) is the agent's
-*self-reported* claim about the actual task. Collapsing these (e.g. treating
-"process exited 0" as "task done") would make a crashed-before-writing-
-WORKLOG.md agent silently look successful.
-
-**Two different "attempt" counters, not one.** `phaseWorkflow`'s own `for`
-loop (executor + up to `max_fix_attempts` fixer retries) all happens inside
-**one** workflow execution — Temporal-level activity retries are
-deliberately disabled for `runAgent` (`retry: { maximumAttempts: 1 }`,
-since agent runs aren't idempotent; recovery is this semantic loop on a
-freshly reset worktree, never a blind re-run of the same attempt).
-Separately, `planWorkflow` tracks a per-phase `retryGeneration`, bumped only
-when a human sends `/resume` after `phaseWorkflow` has already returned
-`parked` (i.e., after its *entire* internal fixer loop is exhausted) — this
-produces a **new child workflow execution** with a derived ID
-(`${parentId}-phase-${index}-r${retryGeneration}`), because a Temporal child
-workflow that already completed can't be "resumed," only re-started fresh.
-
-**Fixer-loop worktree reset target: the phase branch's own initial commit,
-never the parent branch.** `createPhaseWorktree` always produces exactly one
-commit on the new branch before the agent ever runs (Graphite's own
-documented behavior for `gt create` with no staged changes; the plain-git
-path creates one explicitly with `--allow-empty` to match). Every attempt
-after the first amends that same commit (`gt modify` / `git commit
---amend`). Resetting to the *parent* branch directly, instead of to this
-captured `initialCommitSha`, would collapse the phase branch onto the
-parent's own commit — and the next amend would then rewrite the *parent's*
-history instead of the phase's own.
+**Decision: the workflow outlives "the code is written".** "An issue being
+marked as completed means all the phases related to it were completed" —
+and completed means *merged*, not *PR opened*. Closing the issue is the
+pipeline's job, so the entity stays alive watching the stack. Checkboxes
+track "phase executed (PR exists)"; issue closure tracks "everything
+merged". Two different facts, two different mechanisms.
 
 ## 5. GitHub mechanics (packages/activities/src/github.ts)
 
+- **The phase checklist is a marker-bracketed section of the issue body**:
+  `<!-- pipeline:phases:begin -->` … `<!-- pipeline:phases:end -->` around a
+  `## Phases` task list (`- [x] Phase 2: … ([PR #12](url))`). The section is
+  always re-rendered *whole* from workflow state and spliced between the
+  markers (`upsertPhaseChecklist` in core — pure string code, unit-tested):
+  idempotent under Temporal's at-least-once activity retries, self-healing
+  if a human mangles a checkbox, and guaranteed to never touch what the
+  human wrote around it. The workflow (single writer) owns every update;
+  phase children never edit the body.
 - **Sub-issues**: `gh` has no native sub-issue command (verified — checked
   `gh issue create --help`/`gh issue edit --help`, no `--parent` flag
   exists). Linking uses the GraphQL `addSubIssue` mutation with
   `subIssueUrl` (the child's plain URL, which `gh issue create` already
   prints — avoids a second lookup for the child's node ID) and
   `replaceParent: true` (idempotent). Listing uses the REST endpoint
-  `GET /repos/{owner}/{repo}/issues/{n}/sub_issues`.
+  `GET /repos/{owner}/{repo}/issues/{n}/sub_issues`. Since the redesign
+  this machinery serves **only** discovered tasks (§7).
 - **Labels must exist on the repo before they can be added to *or removed
   from* an issue** — verified directly against a real repo:
   `gh issue edit --add-label`/`--remove-label` both fail with `'<label>'
@@ -204,11 +209,16 @@ history instead of the phase's own.
   `removeLabels` treats "label doesn't exist" as an already-satisfied
   no-op (removing a label that was never even defined on the repo can't
   meaningfully fail).
-- **Control-plane comments live on the root issue, not the sub-issue.**
-  Sub-issues accumulate the execution log (worklog comments); the root
-  issue is where every "awaiting X" comment and state label goes, and where
-  a parked phase's explanation gets posted — one place for a human to look
-  for "what does this pipeline need from me."
+- **Everything lands on the root issue** — plan, questions, answers,
+  per-phase worklogs (labeled `## Phase k/N worklog`), park explanations,
+  merge-wait status. One page for a human to read top to bottom, and the
+  exact page every agent session is told to read first.
+- **PR merge states**: `gh pr view <n> --json state` reports
+  `OPEN | CLOSED | MERGED` — `CLOSED` strictly means closed-without-merge,
+  so the merge wait treats it as "needs a human look", not success.
+- `closeIssueCompleted` uses `gh issue close --reason completed --comment`
+  (flags verified against gh's help) and treats "already closed" as
+  satisfied.
 
 ## 6. Git/Graphite mechanics (packages/activities/src/git.ts)
 
@@ -221,42 +231,143 @@ history instead of the phase's own.
   does **not** populate `remote.origin.fetch`; fixed immediately after
   cloning (`git config remote.origin.fetch
   '+refs/heads/*:refs/remotes/origin/*'`), before any fetch is attempted.
+- **Real bug found during the redesign: the bare clone's local trunk ref
+  goes stale.** The refspec above only updates `refs/remotes/origin/*`, so
+  `refs/heads/<trunk>` in the bare clone stayed frozen at clone time — and
+  trunk is exactly what the planning worktree and every phase-1 branch are
+  cut from, so the *second* issue ever run against a repo would have
+  planned and built against weeks-old code. `fetchRepo` now also runs
+  `git fetch origin +<trunk>:<trunk>` (verified empirically: fetching into
+  a bare repo's current branch is allowed — the "refusing to fetch into
+  current branch" guard only applies to non-bare repos — and worktrees
+  don't block it as long as trunk itself is never checked out in one,
+  which it never is here: phase worktrees sit on phase branches and the
+  planning worktree is detached). Covered by a real test in git.test.ts.
+- **The planning worktree** (`createPlanningWorktree`) is a detached
+  checkout of trunk at `~/pipelines/<name>/phases/<issue>/planning`,
+  recreated from scratch on every planning round (planning against stale
+  code is worse than the second it takes to re-add). Detached on purpose:
+  the planner never commits, so it never needs a branch — and a branchless
+  worktree can never collide with the branch-checkout rules below.
 - **Phase worktrees** live at a fixed path derived from `os.homedir()`, the
   repo's `pipeline.yaml` key name, the root issue number, and the phase
   number (`buildPhaseWorktreePath` in core) — **independent of whatever
   custom `local_path` was chosen for the bare clone.**
 - **Every phase branch (including phase 1) is created via `git worktree add
-  --detach <path> <parentRef>` then `gt create <name> --onto <parentRef>`**
-  (or `git checkout -b` for the plain-git path) — never `worktree add -b`
-  directly. A branch already checked out in one worktree can't be checked
-  out in a second one; detaching at the parent's tip first and
-  materializing the new branch *inside* the worktree is Graphite's own
-  documented fix for this, and happens to make phase 1 (parentRef = trunk)
-  and phase N>1 (parentRef = previous phase's branch) the same code path.
+  --detach <path> <parentRef>` then `git checkout -B <name>` + `gt track
+  --parent <parentRef>`** (or plain checkout for the git path) — never
+  `worktree add -b`, and never `gt create`. A branch already checked out in
+  one worktree can't be checked out in a second one; detaching at the
+  parent's tip first and materializing the new branch *inside* the worktree
+  sidesteps that, and happens to make phase 1 (parentRef = trunk) and phase
+  N>1 (parentRef = previous phase's branch) the same code path. `gt create`
+  specifically **fails from a detached HEAD** ("Cannot perform this
+  operation without a branch checked out" — verified against a real
+  failure, regardless of `--onto`), which is also why the executor prompt
+  tells the agent to commit with plain git and submit with `gt submit`,
+  never to run `gt create` itself, even though the original design sketch
+  said "a PR using `gt create` and `gt submit`". `gt track --parent <ref>`
+  only touches Graphite's own metadata db, so it works even while `<ref>`
+  is checked out live in a different worktree — verified directly against
+  that exact scenario too. (`gt parent` is the read-side check for "is this
+  branch tracked" — note its `--quiet` suppresses stdout, so the **exit
+  code** is the signal, not output text.)
+- **The agent owns its commits; the pipeline guarantees convergence.** The
+  executor session commits its own work (plain `git add`+`git commit`) and,
+  on the graphite path, runs `gt submit` itself. After every session the
+  pipeline then (a) commits anything left uncommitted as a **new** commit
+  (`commitLeftoverChanges` — never an amend, which would silently rewrite a
+  commit the agent may already have pushed) and (b) unconditionally
+  (re)submits the branch (`submitPhaseBranch`): `gt submit` for graphite
+  (idempotent; creates the PR if missing, pushes new commits, force-pushes
+  a rewritten branch after a fixer reset), or `git push --force-with-lease`
+  + `gh pr create`-if-missing for the git path. **This "always resubmit"
+  replaced a real latent bug**: the old `submitPullRequest` early-returned
+  whenever a PR already existed for the branch, so a fixer attempt's
+  rewritten commits never actually reached an already-open PR — the PR
+  silently kept showing attempt 1's code.
+- **Fixer-loop worktree reset target: the phase branch's own initial
+  commit, never the parent branch.** `createPhaseWorktree` always produces
+  exactly one (empty) commit on the new branch before the agent ever runs.
+  Every fixer attempt starts from `git reset --hard <initialCommitSha>` +
+  `git clean -fd`, wiping the previous attempt's commits *and* leftovers.
+  Resetting to the *parent* branch directly would collapse the phase branch
+  onto the parent's own commit and the branch's history would bleed into
+  the parent's.
 - **`gt submit` has no flag for setting PR title/body non-interactively** —
   confirmed via `gt submit --help`. The flow always finalizes the real PR
-  body via `gh pr edit --body-file` afterward, regardless of which stack
-  tool opened the PR, and always resolves the definitive PR via `gh pr view
-  <branch>` rather than parsing either tool's stdout.
+  body via `gh pr edit --body-file` afterward, and always resolves the
+  definitive PR via `gh pr view <branch>` rather than parsing either tool's
+  stdout.
 - **Graphite needs its own auth token**, separate from `gh auth` —
   `gt auth --token <token>` (token from
-  https://app.graphite.com/activate). Not configured on the machine this
-  was built on. `branching.stack_tool: git` is the fallback that needs none
-  of this (plain `git push` + `gh pr create --base`), and produces the same
-  branch-stacking shape.
+  https://app.graphite.com/activate). `branching.stack_tool: git` is the
+  fallback that needs none of this (plain `git push` + `gh pr create
+  --base`), and produces the same branch-stacking shape.
 
-## 7. The WORKLOG.md contract (packages/activities/src/agents.ts)
+## 7. `phaseWorkflow` + the WORKLOG.md contract
 
-Executor/fixer prompts require the agent to write `WORKLOG.md` at the
-worktree root with five `##` sections in order: `Done`, `Deviations from
-spec`, `Surprises / new findings`, `Follow-ups`, and a final literal
-`## Status: done` or `## Status: blocked` line. `readAndClearWorklog`
-parses it, then **renames** it to `WORKLOG.md.processed` rather than
-deleting it — a retry landing after a crash between "rename" and "return"
-(Temporal activities are at-least-once) finds the `.processed` file and
-re-parses from there instead of falsely throwing "missing."
+One phase, one child workflow execution (per `retryGeneration`, §4). Loop
+body (`for (attempt = 0; attempt <= max_fix_attempts; attempt++)`):
+1. `attempt === 0`: build the **executor** prompt — which is deliberately
+   thin, because the issue is the context: "Plan an implementation of
+   GitHub issue #N by reading all the contents (`gh issue view N
+   --comments`) … You are implementing phase k of T ONLY", plus the
+   operational contract (where the worktree is, commit + `gt submit`, no
+   `gt create`, comment back deviations via `gh issue comment`) and the
+   WORKLOG contract. `attempt > 0`: reset the worktree, build the **fixer**
+   prompt with the previous attempt's failure reason baked in
+   (`agent_crashed` | `worklog_contract_violation` | `declared_blocked` |
+   `gate_failure`).
+2. `runAgent` — the Claude CLI invocation. `AgentResult.ok` answers **only**
+   "did the process exit cleanly," nothing about task success.
+3. If `!agentResult.ok`: that's `agent_crashed`, skip straight to the retry
+   decision (no worklog to read — the process never got that far).
+4. Otherwise `readAndClearWorklog` parses the required `WORKLOG.md`
+   contract. A missing file or missing section throws
+   `WorklogContractViolationError` → `worklog_contract_violation`, also
+   straight to the retry decision.
+5. Otherwise: post the worklog as a phase-labeled comment on the root
+   issue, **immediately file discovered tasks**, run advisory gates, commit
+   leftovers, (re)submit the PR, write the PR body. Then branch on
+   `worklog.status`: `"blocked"` → `declared_blocked`, retry decision.
+   `"done"` with `policy.local_gates: blocking` and a failing gate →
+   `gate_failure`, retry decision. `"done"` and gates pass (or are
+   advisory) → return `{status: "done", headBranch, prNumber, prUrl}` (the
+   parent ticks the checkbox).
+6. Retry decision: `attempt === max_fix_attempts` → post a parked-comment on
+   the root issue with a `pipeline:stalled` label, return
+   `{status: "parked", …}`. Otherwise loop again (worktree reset first, at
+   the top of the next iteration).
 
-The section-header regex (`/^##\s+([^\n]+)\n?/`) had a real bug during
+**WORKLOG.md**: executor/fixer prompts require the agent to write it at the
+worktree root with `##` sections `Done`, `Deviations from spec`,
+`Surprises / new findings`, `Follow-ups`, **`Discovered tasks`** (optional
+in the parser — an agent forgetting it shouldn't fail the phase; required
+by the prompt), and a final literal `## Status: done|blocked` line.
+`readAndClearWorklog` parses it, then **renames** it to
+`WORKLOG.md.processed` rather than deleting it — a retry landing after a
+crash between "rename" and "return" (Temporal activities are at-least-once)
+finds the `.processed` file and re-parses from there instead of falsely
+throwing "missing."
+
+**Discovered tasks → sub-issues.** Each `- <title> -- <context>` bullet in
+that section becomes a sub-issue of the root issue (`fileDiscoveredTasks` →
+`createDiscoveredTaskIssue`), with the body recording which phase surfaced
+it. Idempotent **by title** among the parent's existing sub-issues, which
+covers both Temporal activity retries and a fixer attempt re-reporting the
+same discovery. The agent is explicitly told NOT to create issues itself —
+one writer, one dedupe point.
+
+**`AgentResult` vs. `WorklogSections` is a deliberate, load-bearing split,
+not two representations of the same thing.** `AgentResult` (core) is the
+adapter's own report on whether the CLI process ran; `WorklogSections`
+(parsed in activities) is the agent's *self-reported* claim about the
+actual task. Collapsing these (e.g. treating "process exited 0" as "task
+done") would make a crashed-before-writing-WORKLOG.md agent silently look
+successful.
+
+**The section-header regex** (`/^##\s+([^\n]+)\n?/`) had a real bug during
 initial testing: an earlier version used a non-greedy `(.+?)` followed by
 an entirely-optional `\s*\n?` tail. Since the whole tail could match zero
 characters, the non-greedy capture stopped after matching just one
@@ -265,37 +376,52 @@ character ("D" instead of "Done") — every real worklog failed with
 `packages/activities/src/agents.test.ts`, not by manual testing — if you
 touch this parser, run that test file, don't just eyeball the regex.
 
-## 8. Adapters (packages/adapters/src)
+## 8. Human-in-the-loop surface (signals/queries + CLI)
 
-Both CLIs verified directly against real invocations (not assumed from
-docs), because the alternative — a subtly wrong flag silently breaking
-every executor run — is exactly the failure mode this layer exists to
-prevent:
+Defined once in `packages/core/src/signals.ts`, shared by worker
+(`setHandler`) and CLI (typed `handle.signal`/`handle.query`):
 
-- **claude**: `-p --output-format json --permission-mode <mode>` (`plan`
-  for the read-only planner, `bypassPermissions` for executor/fixer — the
-  worktree sandboxing is the safety boundary, not the permission mode; see
-  the original proposal's own reasoning: "blast radius is a branch, worst
-  case is a bad PR"). No `--max-turns` flag exists (checked the full help
-  output) — only `--max-budget-usd`. Confirmed JSON shape via a real call:
-  `{type: "result", is_error: bool, result: string, num_turns,
-  total_cost_usd, session_id, subtype}`.
-- **codex**: `-a never exec --sandbox workspace-write --skip-git-repo-check
-  --output-last-message <file>`. Two things confirmed the hard way: `-a`
-  (approval policy) is a **top-level** flag and errors if placed after
-  `exec` (`codex exec -a never` fails; `codex -a never exec` works).
-  `--full-auto`'s default approval policy is "ask on failure" — in a
-  headless activity with no human to answer, that hangs until the activity
-  times out; `-a never` ("execution failures are immediately returned to
-  the model") is the correct choice for unattended execution, not the
-  more commonly-documented `--full-auto` shortcut.
-- **Codex isn't the default adapter right now** — not an architectural
-  choice, just that the `codex` CLI installed where this was built (brew,
-  0.30.0) is far behind the API's current model roster and fails outright
-  (`gpt-5.4 requires a newer version of Codex`); `npm i -g @openai/codex`
-  has 0.147.0. All three roles default to `claude` in
-  `pipeline.example.yaml` until that's resolved; swapping any role back is
-  a one-line config edit (`adapter: codex`), not a code change.
+| Signal / query | CLI | Valid when | Effect |
+|---|---|---|---|
+| `questionsAnswered` | `pipe answer <ref> <n> "<text>"` | awaiting_answers | Records the answer to question n of the *current* round; when all are in, answers are posted to the issue and the planner re-runs |
+| `resume` | `pipe resume <ref>` | parked | Retries the parked phase as a new child execution |
+| `skip` | `pipe skip <ref>` | parked | Ticks the phase with a "skipped by human" note and advances |
+| `abort` | `pipe abort <ref>` | any non-terminal | Ends the workflow (comment posted, `pipeline:in-progress` removed) |
+| `checkMerges` | `pipe check <ref>` | awaiting_merge | Polls PR states now instead of waiting out the interval |
+| `status` query | `pipe status <ref>` | always | Stage, per-phase status/branch/PR, pending questions |
+
+`pipe status` without an argument is the old connectivity check.
+
+## 9. Adapter (packages/adapters/src)
+
+Claude only. The CLI contract was verified directly against real
+invocations (not assumed from docs), because the alternative — a subtly
+wrong flag silently breaking every executor run — is exactly the failure
+mode this layer exists to prevent:
+
+- `claude -p --output-format json --permission-mode <mode>`, prompt on
+  stdin. `plan` for the planner (Claude Code **plan mode**: read-only
+  exploration of the checkout it's pointed at — the planner's whole job is
+  to read code and answer with JSON), `bypassPermissions` for
+  executor/fixer — the worktree sandboxing is the safety boundary, not the
+  permission mode ("the blast radius is a branch, worst case is a bad
+  PR"). Executor/fixer sessions *need* the loose mode: their contract
+  includes running `gh issue view/comment` and `gt submit` unattended.
+- No `--max-turns` flag exists (checked the full help output) — only
+  `--max-budget-usd`, which is what `roles.<role>.max_budget_usd` feeds.
+- Confirmed JSON result shape via a real call: `{type: "result", is_error:
+  bool, result: string, num_turns, total_cost_usd, session_id, subtype}`.
+  `session_id` is captured into `AgentResult.meta` — unused today, but
+  it's what `claude --resume <session-id>` would need if fixer attempts
+  ever want to continue the executor's session instead of starting fresh
+  (deliberately not done: fresh sessions that re-read the issue are the
+  point of GitHub-as-memory).
+- **Why codex was removed** (history, so nobody re-adds it casually): it
+  was never load-bearing — the codex CLI installed where this was built
+  was far behind the API's model roster and failed outright, so all roles
+  already defaulted to claude. Going single-vendor deleted a second prompt
+  dialect, a second output-parsing path, and a second failure mode, in
+  exchange for a one-line enum change if it ever comes back.
 - **Heartbeating**: `adapters/src/process.ts`'s `spawnWithTimeout` accepts
   an `onProgress` callback wired to `Context.current().heartbeat()` (via a
   deferred `require("@temporalio/activity")`, so adapters stay callable
@@ -305,7 +431,7 @@ prevent:
   would kill a legitimately-still-running multi-minute agent process for
   "missing heartbeat" regardless of actual progress.
 
-## 9. Workflow ID reuse policy
+## 10. Workflow ID reuse policy
 
 `pipe start` uses `WorkflowIdReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY`, not
 `REJECT_DUPLICATE`. This was a real bug in the first version: `REJECT_
@@ -318,8 +444,10 @@ ONLY` gives the actually-wanted semantics: block re-running an issue whose
 pipeline already *completed successfully*, freely allow retrying one that
 failed/was terminated/was cancelled. A still-running execution is
 unaffected either way — `signalWithStart` just delivers the signal to it.
+(Continue-as-new is unaffected too: the new execution continues under the
+same workflow ID as part of the same execution chain.)
 
-## 10. Local infra (docker/docker-compose.yml)
+## 11. Local infra (docker/docker-compose.yml)
 
 Postgres (`ipl-postgres`, 5433), Temporal (`ipl-temporal`, 7833),
 Temporal UI (`ipl-temporal-ui`, 8833) — all on non-default ports so this
@@ -337,7 +465,7 @@ which resolves correctly via Docker's embedded DNS even from within the
 same container: `["CMD", "temporal", "operator", "cluster", "health",
 "--address", "temporal:7233"]`.
 
-## 11. Roadmap: what upgrading this next actually involves
+## 12. Roadmap: what upgrading this next actually involves
 
 **M4 — event bridge.** The design this was scoped against calls for a
 60-second polling `BridgePollWorkflow` (Temporal Schedules can only start
@@ -349,13 +477,11 @@ inside that one activity — workflow code can't hold a `Client` directly,
 but `getExternalWorkflowHandle(workflowId)` from `@temporalio/workflow` can
 signal an already-running workflow with no Client at all); an activity that
 scans unprocessed comments on issues carrying a `pipeline:*` state label for
-`/approve /resume /skip /abort /answer N: text` and routes them to the
-right signal based on the issue's current label (`/approve` means different
-things depending on state — resolve that from the scanning activity, don't
-double-signal); and de-duplication via a bot-reaction marker on already-
-processed comments. None of `plan.ts`/`phase.ts` need to change — the
-signals and workflow-ID scheme already exist in `packages/core/src/
-signals.ts` for exactly this.
+`/resume /skip /abort /answer N: text /check` and routes them to the right
+signal based on the issue's current label; and de-duplication via a
+bot-reaction marker on already-processed comments. None of
+`issue.ts`/`phase.ts` need to change — the signals and workflow-ID scheme
+already exist in `packages/core/src/signals.ts` for exactly this.
 
 **`pipe repo add` / `pipe init`.** Needs a pure "given pipeline.yaml's raw
 text and a new repo entry, return the edited text" function in core (safe
@@ -368,8 +494,9 @@ ban on the CLI doing any I/O of its own).
 **`stack_final_gate`.** After the last phase, run the full configured gate
 suite against the stack's top branch; on failure, a fixer loop targeting
 whichever phase branch owns the failing code, followed by a restack
-(`gt restack` cascades automatically to descendants after `gt modify`
-amends an ancestor — confirmed via `gt modify --help`).
+(`gt restack` cascades automatically to descendants after an ancestor is
+amended — confirmed via `gt modify --help`). The natural place is between
+the execution loop and the merge wait in `issueWorkflow`.
 
 **Reviewer role / mid-stack rework (M5).** The adapter/config plumbing for
 a fourth role already generalizes cleanly (`AgentRole` in
@@ -377,7 +504,9 @@ a fourth role already generalizes cleanly (`AgentRole` in
 | "fixer"` — add `"reviewer"`, plus a `ReviewerOutput` schema and prompt
 template alongside the existing ones in `packages/adapters/src/prompts/`).
 The harder part is wiring an automated review step into `phaseWorkflow`
-without weakening the "closed sub-issue = phase advanced" invariant the
-whole system leans on (§5) — reviewer-rejects should probably feed the
-existing fixer loop (a new `FailureReason` variant) rather than becoming a
-third, separate retry mechanism.
+without weakening the "checkbox ticked = phase advanced" invariant —
+reviewer-rejects should probably feed the existing fixer loop (a new
+`FailureReason` variant) rather than becoming a third, separate retry
+mechanism. The merge wait also gives M5 a natural home for *mid-stack
+rework*: a `CLOSED` PR discovered during the poll could re-open a fixer
+child for that phase instead of just warning.

@@ -5,7 +5,7 @@ import { withPipelineHandle } from "../lib/signal-helper";
 export function registerSkipCommand(program: Command): void {
   program
     .command("skip")
-    .description("Skip the currently parked phase and move on to the next one")
+    .description("Skip the currently parked phase (its checkbox is marked with a note) and move on")
     .argument("<issue-ref>", 'GitHub issue URL or "owner/repo#123"')
     .option("--note <text>", "Optional note to record with the skip")
     .action(async (issueRefArg: string, opts: { note?: string }) => {

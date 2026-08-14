@@ -1,4 +1,4 @@
-import { planWorkflowId } from "@issue-pipeline/core";
+import { issueWorkflowId } from "@issue-pipeline/core";
 
 export interface IssueRef {
   owner: string;
@@ -26,5 +26,5 @@ export function parseIssueRef(ref: string): IssueRef {
 }
 
 export function issueRefToWorkflowId(ref: IssueRef): string {
-  return planWorkflowId(ref.owner, ref.repo, ref.issueNumber);
+  return issueWorkflowId(ref.owner, ref.repo, ref.issueNumber);
 }

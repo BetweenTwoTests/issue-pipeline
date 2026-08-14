@@ -24,12 +24,22 @@ test("PlannerOutputSchema accepts a well-formed decomposition", () => {
         goal: "Create the DB schema",
         spec: "Full spec text",
         acceptance: ["Migration runs cleanly"],
-        depends_on_previous: false,
       },
     ],
-    open_questions: [{ q: "Which DB?", proposed_answer: "Postgres", blocking: false }],
+    open_questions: [{ q: "Which DB?", proposed_answer: "Postgres" }],
   });
   assert.equal(result.success, true);
+});
+
+test("PlannerOutputSchema defaults a question's proposed_answer to empty", () => {
+  const result = PlannerOutputSchema.safeParse({
+    phases: [{ title: "t", goal: "g", spec: "s", acceptance: ["a"] }],
+    open_questions: [{ q: "Which DB?" }],
+  });
+  assert.equal(result.success, true);
+  if (result.success) {
+    assert.equal(result.data.open_questions[0].proposed_answer, "");
+  }
 });
 
 test("PlannerOutputSchema rejects an empty phases array", () => {
@@ -39,10 +49,16 @@ test("PlannerOutputSchema rejects an empty phases array", () => {
 
 test("PlannerOutputSchema rejects unknown extra fields (strict)", () => {
   const result = PlannerOutputSchema.safeParse({
-    phases: [
-      { title: "t", goal: "g", spec: "s", acceptance: ["a"], depends_on_previous: false, extra_field: "nope" },
-    ],
+    phases: [{ title: "t", goal: "g", spec: "s", acceptance: ["a"], extra_field: "nope" }],
     open_questions: [],
+  });
+  assert.equal(result.success, false);
+});
+
+test("PlannerOutputSchema rejects the retired blocking/depends_on_previous fields", () => {
+  const result = PlannerOutputSchema.safeParse({
+    phases: [{ title: "t", goal: "g", spec: "s", acceptance: ["a"], depends_on_previous: true }],
+    open_questions: [{ q: "Which DB?", proposed_answer: "", blocking: true }],
   });
   assert.equal(result.success, false);
 });
