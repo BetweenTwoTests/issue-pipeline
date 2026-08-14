@@ -6,6 +6,7 @@ import { registerResumeCommand } from "./commands/resume";
 import { registerSkipCommand } from "./commands/skip";
 import { registerAbortCommand } from "./commands/abort";
 import { registerAnswerCommand } from "./commands/answer";
+import { registerCheckCommand } from "./commands/check";
 
 const program = new Command();
 program.name("pipe").description("issue-pipeline control CLI");
@@ -16,5 +17,6 @@ registerResumeCommand(program);
 registerSkipCommand(program);
 registerAbortCommand(program);
 registerAnswerCommand(program);
+registerCheckCommand(program);
 
 program.parseAsync(process.argv);

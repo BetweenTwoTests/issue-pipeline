@@ -1,21 +1,31 @@
 import { proxyActivities } from "@temporalio/workflow";
-import type * as activities from "@issue-pipeline/activities";
 import { buildPhaseBranchName, type RegisteredRepo, type PipelineConfig } from "@issue-pipeline/core";
+import type * as activities from "@issue-pipeline/activities";
 
 const quick = proxyActivities<typeof activities>({
   startToCloseTimeout: "30s",
   retry: { maximumAttempts: 3 },
 });
-const { loadPipelineConfig, resolveRegisteredRepoBySlug, ensureBareClone, fetchRepo, postComment, addLabels, closeSubIssue, setPullRequestBody } =
-  quick;
+const { loadPipelineConfig, resolveRegisteredRepoBySlug, postComment, addLabels, setPullRequestBody } = quick;
+
+// GitHub round-trips that may involve several gh calls each (sub-issue
+// listing + creation, worklog comment posting).
+const githubOps = proxyActivities<typeof activities>({
+  startToCloseTimeout: "2m",
+  retry: { maximumAttempts: 3 },
+});
+const { postPhaseWorklogComment, fileDiscoveredTasks } = githubOps;
 
 // Worktree/git operations -- can be slow on a cold cache; safe to retry, every
-// one of them is designed idempotent (see git.ts).
+// one of them is designed idempotent (see git.ts). submitPhaseBranch is in
+// here too: gt submit / git push --force-with-lease converge to the same
+// state on re-run, so a Temporal retry after a transient network failure is
+// safe.
 const gitOps = proxyActivities<typeof activities>({
   startToCloseTimeout: "10m",
   retry: { maximumAttempts: 3 },
 });
-const { createPhaseWorktree, resetWorktreeHard, commitWorktreeChanges, submitPullRequest } = gitOps;
+const { createPhaseWorktree, resetWorktreeHard, commitLeftoverChanges, submitPhaseBranch } = gitOps;
 
 const promptBuilding = proxyActivities<typeof activities>({
   startToCloseTimeout: "2m",
@@ -48,29 +58,30 @@ const worklogHandling = proxyActivities<typeof activities>({
   startToCloseTimeout: "30s",
   retry: { maximumAttempts: 3 },
 });
-const { readAndClearWorklog, postWorklogComment } = worklogHandling;
+const { readAndClearWorklog } = worklogHandling;
 
 export interface PhaseWorkflowInput {
   owner: string;
   repo: string;
-  planIssueNumber: number;
+  /** The root issue -- the single source of truth the executor session reads
+   * (`gh issue view <n> --comments`) and comments on. There is no per-phase
+   * sub-issue anymore. */
+  issueNumber: number;
   /** 0-based. */
   phaseIndex: number;
   totalPhases: number;
-  subIssueNumber: number;
   phaseTitle: string;
-  phaseGoal: string;
-  phaseSpec: string;
-  acceptance: string[];
   branchSlug: string;
   /** repo.defaultBranch for phase 1, else the previous phase's branch name. */
   baseBranch: string;
-  priorSubIssueNumbers: number[];
 }
 
 export interface PhaseWorkflowResult {
   status: "done" | "parked";
   headBranch: string;
+  /** Null when no attempt got far enough to submit (e.g. every attempt crashed). */
+  prNumber: number | null;
+  prUrl: string | null;
 }
 
 type FailureReason = "gate_failure" | "worklog_contract_violation" | "agent_crashed" | "declared_blocked";
@@ -78,18 +89,17 @@ type FailureReason = "gate_failure" | "worklog_contract_violation" | "agent_cras
 export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWorkflowResult> {
   const config = await loadPipelineConfig();
   const repo = await resolveRegisteredRepoBySlug(config, input.owner, input.repo);
-  await ensureBareClone(repo);
-  await fetchRepo(repo);
 
   const phaseNumber = input.phaseIndex + 1;
+  const repoSlug = `${input.owner}/${input.repo}`;
   // Pure string formatting (no system state) -- safe to call directly in
   // workflow code, unlike the worktree's filesystem path, which depends on
   // os.homedir() and is computed inside createPhaseWorktree instead.
-  const branchName = buildPhaseBranchName(config.branching.branch_prefix, input.planIssueNumber, phaseNumber, input.branchSlug);
+  const branchName = buildPhaseBranchName(config.branching.branch_prefix, input.issueNumber, phaseNumber, input.branchSlug);
 
   const worktree = await createPhaseWorktree({
     repo,
-    rootIssueNumber: input.planIssueNumber,
+    rootIssueNumber: input.issueNumber,
     phase: phaseNumber,
     parentRef: input.baseBranch,
     newBranchName: branchName,
@@ -97,6 +107,7 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
   });
 
   let priorFailure: { reason: FailureReason; detail: string } | undefined;
+  let lastPr: { url: string; number: number } | null = null;
   const maxFixAttempts = config.policy.max_fix_attempts;
 
   // attempt 0 = the initial executor run; attempts 1..maxFixAttempts = fixer runs.
@@ -108,23 +119,23 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
     const prompt =
       attempt === 0
         ? await buildExecutorPrompt({
-            repo,
+            repoSlug,
+            issueNumber: input.issueNumber,
             phaseNumber,
             totalPhases: input.totalPhases,
             phaseTitle: input.phaseTitle,
-            phaseGoal: input.phaseGoal,
-            phaseSpec: input.phaseSpec,
-            acceptance: input.acceptance,
+            branch: worktree.branch,
             baseBranch: input.baseBranch,
-            priorSubIssueNumbers: input.priorSubIssueNumbers,
+            stackTool: config.branching.stack_tool,
           })
         : await buildFixerPrompt({
+            repoSlug,
+            issueNumber: input.issueNumber,
             phaseNumber,
             totalPhases: input.totalPhases,
             phaseTitle: input.phaseTitle,
-            phaseGoal: input.phaseGoal,
-            phaseSpec: input.phaseSpec,
-            acceptance: input.acceptance,
+            branch: worktree.branch,
+            stackTool: config.branching.stack_tool,
             reason: priorFailure!.reason,
             detail: priorFailure!.detail,
             attemptNumber: attempt,
@@ -141,7 +152,7 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
     if (!agentResult.ok) {
       priorFailure = { reason: "agent_crashed", detail: agentResult.summary };
       if (attempt === maxFixAttempts) {
-        return park(repo, config, input, worktree.branch, "agent_crashed", agentResult.summary);
+        return park(repo, config, input, worktree.branch, lastPr, "agent_crashed", agentResult.summary);
       }
       continue;
     }
@@ -153,21 +164,30 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
       const detail = err instanceof Error ? err.message : String(err);
       priorFailure = { reason: "worklog_contract_violation", detail };
       if (attempt === maxFixAttempts) {
-        return park(repo, config, input, worktree.branch, "worklog_contract_violation", detail);
+        return park(repo, config, input, worktree.branch, lastPr, "worklog_contract_violation", detail);
       }
       continue;
     }
 
-    await postWorklogComment(repo, input.subIssueNumber, worklog);
+    // Worklogs land on the root issue (labeled by phase) -- they are the
+    // handoff context the NEXT phase's session reads via `gh issue view`.
+    await postPhaseWorklogComment(repo, input.issueNumber, phaseNumber, input.totalPhases, worklog);
+    // "Immediately file discovered tasks": every out-of-scope task the agent
+    // reported becomes a sub-issue of the root issue, recording which phase
+    // it came from -- the one remaining use of sub-issues in this system.
+    await fileDiscoveredTasks(repo, input.issueNumber, phaseNumber, worklog.discoveredTasks);
+
     const gateResult = await runLocalGates(worktree.worktreePath, config);
 
-    await commitWorktreeChanges({
+    // The agent owns its commits and (on the graphite path) usually its own
+    // `gt submit`. These two are the pipeline-side guarantee: anything left
+    // uncommitted gets committed, and the branch is (re)submitted after
+    // EVERY session so the PR always matches the branch.
+    await commitLeftoverChanges({
       worktreePath: worktree.worktreePath,
-      stackTool: config.branching.stack_tool,
-      message: `${input.phaseTitle}\n\n${worklog.done}`,
+      message: `Phase ${phaseNumber}: auto-commit of changes the agent left uncommitted`,
     });
-
-    const pr = await submitPullRequest({
+    const pr = await submitPhaseBranch({
       worktreePath: worktree.worktreePath,
       branch: worktree.branch,
       parentRef: input.baseBranch,
@@ -177,12 +197,13 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
       title: `Phase ${phaseNumber}/${input.totalPhases}: ${input.phaseTitle}`,
       draft: config.branching.pr_draft,
     });
+    lastPr = pr;
     await setPullRequestBody(repo, pr.number, formatPrBody(worklog, gateResult));
 
     if (worklog.status === "blocked") {
       priorFailure = { reason: "declared_blocked", detail: worklog.followUps };
       if (attempt === maxFixAttempts) {
-        return park(repo, config, input, worktree.branch, "declared_blocked", worklog.followUps);
+        return park(repo, config, input, worktree.branch, lastPr, "declared_blocked", worklog.followUps);
       }
       continue;
     }
@@ -195,13 +216,12 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
         .join("\n\n");
       priorFailure = { reason: "gate_failure", detail };
       if (attempt === maxFixAttempts) {
-        return park(repo, config, input, worktree.branch, "gate_failure", detail);
+        return park(repo, config, input, worktree.branch, lastPr, "gate_failure", detail);
       }
       continue;
     }
 
-    await closeSubIssue(repo, input.subIssueNumber, `Closed by issue-pipeline. PR: ${pr.url}`);
-    return { status: "done", headBranch: worktree.branch };
+    return { status: "done", headBranch: worktree.branch, prNumber: pr.number, prUrl: pr.url };
   }
 
   throw new Error("phaseWorkflow: fell through the fixer loop unexpectedly");
@@ -212,22 +232,30 @@ async function park(
   config: PipelineConfig,
   input: PhaseWorkflowInput,
   headBranch: string,
+  lastPr: { url: string; number: number } | null,
   reason: FailureReason,
   detail: string,
 ): Promise<PhaseWorkflowResult> {
-  await addLabels(repo, input.planIssueNumber, ["pipeline:stalled"]);
+  await addLabels(repo, input.issueNumber, ["pipeline:stalled"]);
   await postComment(
     repo,
-    input.planIssueNumber,
-    `Phase ${input.phaseIndex + 1}/${input.totalPhases} (sub-issue #${input.subIssueNumber}) is parked after ${config.policy.max_fix_attempts} fix attempt(s).\n\n` +
+    input.issueNumber,
+    `Phase ${input.phaseIndex + 1}/${input.totalPhases} ("${input.phaseTitle}") is parked after ${config.policy.max_fix_attempts} fix attempt(s).\n\n` +
       `Reason: ${reason}\n${detail}\n\n` +
       "Use `pipe resume`, `pipe skip`, or `pipe abort` on this pipeline to continue.",
   );
-  return { status: "parked", headBranch };
+  return { status: "parked", headBranch, prNumber: lastPr?.number ?? null, prUrl: lastPr?.url ?? null };
 }
 
 function formatPrBody(
-  worklog: { done: string; deviationsFromSpec: string; surprisesFindings: string; followUps: string; status: string },
+  worklog: {
+    done: string;
+    deviationsFromSpec: string;
+    surprisesFindings: string;
+    followUps: string;
+    discoveredTasks: string;
+    status: string;
+  },
   gateResult: { passed: boolean; results: Array<{ name: string; ok: boolean }> },
 ): string {
   const gateLine = gateResult.passed
@@ -236,5 +264,5 @@ function formatPrBody(
         .filter((r) => !r.ok)
         .map((r) => r.name)
         .join(", ")} failed`;
-  return `## Done\n${worklog.done}\n\n## Deviations from spec\n${worklog.deviationsFromSpec}\n\n## Surprises / new findings\n${worklog.surprisesFindings}\n\n## Follow-ups\n${worklog.followUps}\n\n---\n${gateLine}`;
+  return `## Done\n${worklog.done}\n\n## Deviations from spec\n${worklog.deviationsFromSpec}\n\n## Surprises / new findings\n${worklog.surprisesFindings}\n\n## Follow-ups\n${worklog.followUps}\n\n## Discovered tasks\n${worklog.discoveredTasks}\n\n---\n${gateLine}`;
 }

@@ -4,11 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { PlannerOutputParseError, WorklogContractViolationError } from "@issue-pipeline/core";
-import { parsePlannerOutput, readAndClearWorklog } from "./agents";
+import { parsePlannerOutput, readAndClearWorklog, parseDiscoveredTasks } from "./agents";
 
 const VALID_PLANNER_JSON = JSON.stringify({
   phases: [
-    { title: "Add schema", goal: "Create the schema", spec: "spec text", acceptance: ["works"], depends_on_previous: false },
+    { title: "Add schema", goal: "Create the schema", spec: "spec text", acceptance: ["works"] },
   ],
   open_questions: [],
 });
@@ -116,4 +116,48 @@ test("readAndClearWorklog is idempotent: a retry after the file was already rena
     const second = await readAndClearWorklog(dir);
     assert.deepEqual(second, first);
   });
+});
+
+test("readAndClearWorklog defaults a missing Discovered tasks section to None. (optional by contract)", async () => {
+  await withTempDir(async (dir) => {
+    await fs.writeFile(path.join(dir, "WORKLOG.md"), VALID_WORKLOG, "utf8");
+    const result = await readAndClearWorklog(dir);
+    assert.equal(result.discoveredTasks, "None.");
+  });
+});
+
+test("readAndClearWorklog captures a present Discovered tasks section", async () => {
+  await withTempDir(async (dir) => {
+    const withTasks = VALID_WORKLOG.replace(
+      "## Status: done",
+      "## Discovered tasks\n- Fix flaky auth test -- it fails under parallel runs\n\n## Status: done",
+    );
+    await fs.writeFile(path.join(dir, "WORKLOG.md"), withTasks, "utf8");
+    const result = await readAndClearWorklog(dir);
+    assert.equal(result.discoveredTasks, "- Fix flaky auth test -- it fails under parallel runs");
+  });
+});
+
+test("parseDiscoveredTasks splits bullets into title/context on the -- separator", () => {
+  const tasks = parseDiscoveredTasks("- Fix flaky auth test -- it fails under parallel runs\n- Upgrade zod");
+  assert.equal(tasks.length, 2);
+  assert.equal(tasks[0].title, "Fix flaky auth test");
+  assert.equal(tasks[0].context, "it fails under parallel runs");
+  assert.equal(tasks[1].title, "Upgrade zod");
+  assert.equal(tasks[1].context, "Upgrade zod");
+});
+
+test("parseDiscoveredTasks treats None. and non-bullet prose as no tasks", () => {
+  assert.deepEqual(parseDiscoveredTasks("None."), []);
+  assert.deepEqual(parseDiscoveredTasks("- None."), []);
+  assert.deepEqual(parseDiscoveredTasks("nothing here\njust prose"), []);
+  assert.deepEqual(parseDiscoveredTasks(""), []);
+});
+
+test("parseDiscoveredTasks truncates an overlong title but keeps full context", () => {
+  const long = "x".repeat(200);
+  const tasks = parseDiscoveredTasks(`- ${long}`);
+  assert.equal(tasks.length, 1);
+  assert.ok(tasks[0].title.length <= 120);
+  assert.equal(tasks[0].context, long);
 });

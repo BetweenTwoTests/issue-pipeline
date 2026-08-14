@@ -4,10 +4,10 @@ import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   GithubCliError,
-  composeSubIssueBody,
-  parseSubIssueMetadata,
+  renderPhaseChecklist,
+  upsertPhaseChecklist,
+  type ChecklistPhase,
   type RegisteredRepo,
-  type SubIssueMetadata,
   type WorklogSections,
 } from "@issue-pipeline/core";
 import { runCommand, isExecFileError } from "./exec";
@@ -21,17 +21,19 @@ export interface RootIssue {
   labels: string[];
 }
 
-export interface CreatedSubIssue {
-  number: number;
-  url: string;
-}
-
 export interface SubIssueSummary {
   number: number;
   url: string;
   state: string;
   title: string;
-  metadata: SubIssueMetadata | null;
+}
+
+export type PullRequestMergeState = "OPEN" | "MERGED" | "CLOSED";
+
+export interface PullRequestState {
+  number: number;
+  url: string;
+  state: PullRequestMergeState;
 }
 
 async function withTempFile<T>(content: string, fn: (path: string) => Promise<T>): Promise<T> {
@@ -92,30 +94,13 @@ export async function listSubIssues(repo: RegisteredRepo, parentIssueNumber: num
     `repos/${repo.owner}/${repo.repo}/issues/${parentIssueNumber}/sub_issues`,
     "--paginate",
   ]);
-  const issues: Array<{ number: number; html_url: string; state: string; title: string; body: string | null }> =
-    JSON.parse(stdout);
+  const issues: Array<{ number: number; html_url: string; state: string; title: string }> = JSON.parse(stdout);
   return issues.map((issue) => ({
     number: issue.number,
     url: issue.html_url,
     state: issue.state,
     title: issue.title,
-    metadata: parseSubIssueMetadata(issue.body),
   }));
-}
-
-export async function getSubIssueMetadata(repo: RegisteredRepo, issueNumber: number): Promise<SubIssueMetadata | null> {
-  const body = await ghOrNull([
-    "issue",
-    "view",
-    String(issueNumber),
-    "--json",
-    "body",
-    "-R",
-    `${repo.owner}/${repo.repo}`,
-    "-q",
-    ".body",
-  ]);
-  return parseSubIssueMetadata(body);
 }
 
 /** Resolves the GraphQL node id for an issue (needed by addSubIssue) via its REST resource. */
@@ -152,27 +137,34 @@ export async function linkSubIssue(repo: RegisteredRepo, parentIssueNumber: numb
   ]);
 }
 
+export interface CreateDiscoveredTaskInput {
+  parentIssueNumber: number;
+  /** 1-based phase the task was discovered in -- recorded in the body for provenance. */
+  phaseNumber: number;
+  title: string;
+  context: string;
+}
+
 /**
- * Idempotent: checks listSubIssues() for an existing {parent, phase} match
- * before creating -- guards against Temporal at-least-once activity retries
- * producing duplicate sub-issues.
+ * Sub-issues are no longer how phases are represented -- the ONLY sub-issues
+ * this system creates now are "discovered tasks": new out-of-scope work an
+ * executor surfaced in its WORKLOG.md. Idempotent by title among the
+ * parent's existing sub-issues (guards both Temporal activity retries and a
+ * fixer attempt re-reporting the same discovery).
  */
-export async function createSubIssue(
+export async function createDiscoveredTaskIssue(
   repo: RegisteredRepo,
-  input: { parentIssueNumber: number; phase: number; title: string; bodyMarkdown: string; baseBranch: string },
-): Promise<CreatedSubIssue> {
+  input: CreateDiscoveredTaskInput,
+): Promise<{ number: number; url: string; created: boolean }> {
   const existing = await listSubIssues(repo, input.parentIssueNumber);
-  const already = existing.find((s) => s.metadata?.parent === input.parentIssueNumber && s.metadata?.phase === input.phase);
-  if (already) return { number: already.number, url: already.url };
+  const already = existing.find((s) => s.title.trim().toLowerCase() === input.title.trim().toLowerCase());
+  if (already) return { number: already.number, url: already.url, created: false };
 
-  const metadata: SubIssueMetadata = {
-    parent: input.parentIssueNumber,
-    phase: input.phase,
-    base_branch: input.baseBranch,
-  };
-  const fullBody = composeSubIssueBody(metadata, input.bodyMarkdown);
+  const body = `Discovered by issue-pipeline while executing phase ${input.phaseNumber} of #${input.parentIssueNumber}.
 
-  const url = await withTempFile(fullBody, (tmpPath) =>
+${input.context}`;
+
+  const url = await withTempFile(body, (tmpPath) =>
     gh(["issue", "create", "--title", input.title, "--body-file", tmpPath, "-R", `${repo.owner}/${repo.repo}`]),
   );
   const trimmedUrl = url.trim();
@@ -182,7 +174,7 @@ export async function createSubIssue(
   }
   const number = Number(match[1]);
   await linkSubIssue(repo, input.parentIssueNumber, number, trimmedUrl);
-  return { number, url: trimmedUrl };
+  return { number, url: trimmedUrl, created: true };
 }
 
 export async function postComment(repo: RegisteredRepo, issueNumber: number, bodyMarkdown: string): Promise<{ url: string }> {
@@ -192,12 +184,17 @@ export async function postComment(repo: RegisteredRepo, issueNumber: number, bod
   return { url: url.trim() };
 }
 
-export async function postWorklogComment(
+/** Worklogs land on the ROOT issue now (there are no phase sub-issues), so
+ * each one is labeled with the phase it belongs to -- both for humans and
+ * for later phases' sessions, whose prompt tells them to read these. */
+export async function postPhaseWorklogComment(
   repo: RegisteredRepo,
   issueNumber: number,
+  phaseNumber: number,
+  totalPhases: number,
   worklog: WorklogSections,
 ): Promise<{ url: string }> {
-  const body = `## Worklog (status: ${worklog.status})
+  const body = `## Phase ${phaseNumber}/${totalPhases} worklog (status: ${worklog.status})
 
 ### Done
 ${worklog.done}
@@ -209,8 +206,30 @@ ${worklog.deviationsFromSpec}
 ${worklog.surprisesFindings}
 
 ### Follow-ups
-${worklog.followUps}`;
+${worklog.followUps}
+
+### Discovered tasks
+${worklog.discoveredTasks}`;
   return postComment(repo, issueNumber, body);
+}
+
+/**
+ * Rewrites the marker-bracketed phase checklist inside the root issue's
+ * body, leaving everything a human wrote untouched. Always re-renders the
+ * whole list from the workflow's own state, so it is idempotent under
+ * activity retries and self-heals if a human mangled a checkbox.
+ */
+export async function updateIssuePhaseChecklist(
+  repo: RegisteredRepo,
+  issueNumber: number,
+  phases: ChecklistPhase[],
+): Promise<void> {
+  const issue = await fetchRootIssue(repo, issueNumber);
+  const newBody = upsertPhaseChecklist(issue.body, renderPhaseChecklist(phases));
+  if (newBody === issue.body) return;
+  await withTempFile(newBody, (tmpPath) =>
+    gh(["issue", "edit", String(issueNumber), "--body-file", tmpPath, "-R", `${repo.owner}/${repo.repo}`]),
+  );
 }
 
 // GitHub requires a label to already exist on the repo before it can be
@@ -255,8 +274,28 @@ export async function removeLabels(repo: RegisteredRepo, issueNumber: number, la
   }
 }
 
-export async function closeSubIssue(repo: RegisteredRepo, issueNumber: number, closingComment: string): Promise<void> {
-  await gh(["issue", "close", String(issueNumber), "--comment", closingComment, "-R", `${repo.owner}/${repo.repo}`]);
+/** Closes the ROOT issue as completed -- the terminal step of issueWorkflow,
+ * reached only after every phase PR in the stack has merged. `gh issue close
+ * -r completed` (flag verified against gh's own help) sets the "completed"
+ * state reason rather than "not planned". Idempotent: closing an
+ * already-closed issue is treated as satisfied. */
+export async function closeIssueCompleted(repo: RegisteredRepo, issueNumber: number, closingComment: string): Promise<void> {
+  try {
+    await gh([
+      "issue",
+      "close",
+      String(issueNumber),
+      "--reason",
+      "completed",
+      "--comment",
+      closingComment,
+      "-R",
+      `${repo.owner}/${repo.repo}`,
+    ]);
+  } catch (err) {
+    if (err instanceof GithubCliError && /already closed/i.test(err.stderr)) return;
+    throw err;
+  }
 }
 
 export async function setPullRequestBody(repo: RegisteredRepo, prNumber: number, bodyMarkdown: string): Promise<void> {
@@ -282,12 +321,38 @@ export async function getPullRequestForBranch(
   return JSON.parse(stdout);
 }
 
+/**
+ * The merge-wait poll: resolves the live state of every phase PR in one
+ * activity call. gh reports state as OPEN | CLOSED | MERGED (a merged PR is
+ * never "CLOSED" in gh's json output; CLOSED strictly means
+ * closed-without-merge).
+ */
+export async function getPullRequestStates(repo: RegisteredRepo, prNumbers: number[]): Promise<PullRequestState[]> {
+  const states: PullRequestState[] = [];
+  for (const prNumber of prNumbers) {
+    const stdout = await gh([
+      "pr",
+      "view",
+      String(prNumber),
+      "--json",
+      "number,url,state",
+      "-R",
+      `${repo.owner}/${repo.repo}`,
+    ]);
+    const parsed = JSON.parse(stdout) as { number: number; url: string; state: PullRequestMergeState };
+    states.push({ number: parsed.number, url: parsed.url, state: parsed.state });
+  }
+  return states;
+}
+
 export interface IssueComment {
   body: string;
   author: string;
 }
 
-/** Used to assemble prior-phase handoff context (worklog comments) for the executor prompt. */
+/** Kept for diagnostics/tests -- phase sessions now read the issue themselves
+ * via `gh issue view --comments`, so the pipeline no longer assembles
+ * handoff context from comments. */
 export async function listComments(repo: RegisteredRepo, issueNumber: number): Promise<IssueComment[]> {
   const stdout = await gh([
     "issue",

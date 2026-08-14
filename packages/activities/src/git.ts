@@ -1,7 +1,12 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { GitOperationError, buildPhaseWorktreePath, type RegisteredRepo } from "@issue-pipeline/core";
+import {
+  GitOperationError,
+  buildPhaseWorktreePath,
+  buildPlanningWorktreePath,
+  type RegisteredRepo,
+} from "@issue-pipeline/core";
 import { runCommand, isExecFileError } from "./exec";
 import { getPullRequestForBranch } from "./github";
 
@@ -76,8 +81,18 @@ export async function ensureBareClone(repo: RegisteredRepo): Promise<void> {
   await git(["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], { cwd: repo.localPath });
 }
 
+/**
+ * Fetches remote-tracking refs AND fast-forwards the bare clone's own local
+ * trunk ref to origin's. The second fetch matters: the configured refspec
+ * only updates refs/remotes/origin/*, so refs/heads/<trunk> in the bare
+ * clone is otherwise frozen at whatever it was at clone time -- and trunk is
+ * exactly the ref the planning worktree and every phase-1 branch are cut
+ * from. The leading + forces through upstream history rewrites; trunk is
+ * never checked out in any pipeline worktree, so updating its ref is safe.
+ */
 export async function fetchRepo(repo: RegisteredRepo): Promise<void> {
   await git(["fetch", "origin", "--prune"], { cwd: repo.localPath });
+  await git(["fetch", "origin", `+${repo.defaultBranch}:${repo.defaultBranch}`], { cwd: repo.localPath });
 }
 
 /** gt init is documented idempotent -- always safe to (re)run, so no marker-file check. */
@@ -118,9 +133,11 @@ export interface PhaseWorktree {
  * real branch and fails with "Cannot perform this operation without a
  * branch checked out" from a detached HEAD, regardless of --onto (the
  * detach is the whole point, so `gt create` can never be used directly
- * here). `gt track --parent <ref>` only touches Graphite's own metadata db,
- * so it works even while <ref> is checked out live in a different worktree
- * -- verified directly against that exact scenario too.
+ * here). This is also why the executor prompt tells the agent to commit
+ * with plain git and submit with `gt submit`, never to run `gt create`
+ * itself. `gt track --parent <ref>` only touches Graphite's own metadata
+ * db, so it works even while <ref> is checked out live in a different
+ * worktree -- verified directly against that exact scenario too.
  */
 export async function createPhaseWorktree(input: CreatePhaseWorktreeInput): Promise<PhaseWorktree> {
   // Computed here, not by the caller: it depends on os.homedir(), which is
@@ -142,11 +159,10 @@ export async function createPhaseWorktree(input: CreatePhaseWorktreeInput): Prom
     // A partial worktree left behind by an interrupted earlier attempt (an
     // activity retry after `gt track`/`git checkout -b` failed partway, or a
     // killed worker) -- verified via a real repro: reusing a branchless one
-    // as-is fails opaquely much later at commitWorktreeChanges ("Cannot
-    // perform this operation without a branch checked out" from gt,
-    // deterministically, on every retry). Tear it down and fall through to
-    // recreate it properly rather than trusting whatever state it was left
-    // in.
+    // as-is fails opaquely much later ("Cannot perform this operation
+    // without a branch checked out" from gt, deterministically, on every
+    // retry). Tear it down and fall through to recreate it properly rather
+    // than trusting whatever state it was left in.
     await removeWorktree(input.repo, worktreePath);
   }
 
@@ -159,9 +175,8 @@ export async function createPhaseWorktree(input: CreatePhaseWorktreeInput): Prom
 
   // Same for both stack tools: an explicit empty commit gives every phase
   // branch a distinguishing commit of its own (distinct from parentRef)
-  // before the agent ever runs, which is what `gt create` would otherwise
-  // have given us for free -- see the doc comment above for why `gt
-  // create` itself can't be used here.
+  // before the agent ever runs -- the stable reset target for fixer
+  // attempts.
   //
   // -B, not -b: removeWorktree (above) only tears down the working
   // directory, not the branch ref itself -- if an interrupted earlier
@@ -184,10 +199,30 @@ export async function createPhaseWorktree(input: CreatePhaseWorktreeInput): Prom
 }
 
 /**
+ * The read-only checkout the planner runs in (Claude Code plan mode). Always
+ * recreated from scratch at the CURRENT trunk tip -- planning against stale
+ * code is worse than the second it takes to re-add a worktree. Detached on
+ * purpose: the planner never commits, so it never needs a branch.
+ */
+export async function createPlanningWorktree(
+  repo: RegisteredRepo,
+  rootIssueNumber: number,
+): Promise<{ worktreePath: string }> {
+  const worktreePath = buildPlanningWorktreePath(os.homedir(), repo.name, rootIssueNumber);
+  if (await pathExists(worktreePath)) {
+    await removeWorktree(repo, worktreePath);
+  }
+  await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+  await git(["worktree", "add", "--detach", worktreePath, repo.defaultBranch], { cwd: repo.localPath });
+  return { worktreePath };
+}
+
+/**
  * Resets to the phase branch's OWN initial commit (never to parentRef
  * directly) -- resetting straight to parentRef would collapse the phase
- * branch onto the parent's commit, and a subsequent amend would then
- * corrupt the *parent's* history instead of the phase's own.
+ * branch onto the parent's commit, and the branch's history would no longer
+ * be its own. Discards the previous attempt's commits AND its uncommitted
+ * leftovers.
  */
 export async function resetWorktreeHard(worktreePath: string, initialCommitSha: string): Promise<void> {
   await git(["reset", "--hard", initialCommitSha], { cwd: worktreePath });
@@ -199,44 +234,65 @@ export async function removeWorktree(repo: RegisteredRepo, worktreePath: string)
 }
 
 /**
- * Always amends the branch's own initial commit (created by
- * createPhaseWorktree) rather than creating a new one -- this keeps every
- * phase branch at exactly one commit whether it's the executor's first pass
- * or the Nth fixer attempt (each attempt starts from a resetWorktreeHard
- * back to that same initial commit).
+ * Terminal cleanup for a finished (merged/closed) issue: best-effort removal
+ * of the planning worktree and every phase worktree, then a prune. Never
+ * throws -- a leftover worktree directory is an inconvenience, not a reason
+ * to fail a pipeline that has already shipped.
  */
-export async function commitWorktreeChanges(input: {
-  worktreePath: string;
-  stackTool: "graphite" | "git";
-  message: string;
-}): Promise<{ committed: boolean }> {
-  if (input.stackTool === "graphite") {
+export async function cleanupIssueWorktrees(
+  repo: RegisteredRepo,
+  rootIssueNumber: number,
+  phaseCount: number,
+): Promise<void> {
+  const paths = [
+    buildPlanningWorktreePath(os.homedir(), repo.name, rootIssueNumber),
+    ...Array.from({ length: phaseCount }, (_, i) =>
+      buildPhaseWorktreePath(os.homedir(), repo.name, rootIssueNumber, i + 1),
+    ),
+  ];
+  for (const p of paths) {
     try {
-      await gt(["modify", "-a", "-m", input.message, "--no-interactive", "--quiet"], input.worktreePath);
-      return { committed: true };
-    } catch (err) {
-      // Best-effort: exact wording for Graphite's "nothing staged" case is
-      // not yet verified against a live gt invocation -- broadened match,
-      // re-throws anything that doesn't look like this specific case.
-      const stderr = isExecFileError(err) ? (err.stderr ?? err.message) : String(err);
-      if (/nothing to commit|no changes|nothing staged/i.test(stderr)) {
-        return { committed: false };
-      }
-      throw err;
+      if (await pathExists(p)) await removeWorktree(repo, p);
+    } catch {
+      // best-effort by design
     }
   }
+  try {
+    await git(["worktree", "prune"], { cwd: repo.localPath });
+  } catch {
+    // best-effort by design
+  }
+}
+
+/**
+ * The agent owns its own commits now (the executor prompt tells it to
+ * `git add` + `git commit` its work). This is the pipeline's safety net for
+ * whatever the agent left uncommitted: a plain additional commit, NEVER an
+ * amend -- amending would silently rewrite a commit the agent may already
+ * have pushed via its own `gt submit`.
+ */
+export async function commitLeftoverChanges(input: {
+  worktreePath: string;
+  message: string;
+}): Promise<{ committed: boolean }> {
   await git(["add", "-A"], { cwd: input.worktreePath });
   const status = await git(["status", "--porcelain"], { cwd: input.worktreePath });
   if (status.trim() === "") return { committed: false };
-  await git(["commit", "--amend", "-m", input.message], { cwd: input.worktreePath });
+  await git(["commit", "-m", input.message], { cwd: input.worktreePath });
   return { committed: true };
 }
 
 /**
- * Idempotent: checks getPullRequestForBranch first -- if a PR already
- * exists for `branch`, returns it unchanged instead of re-creating.
+ * Runs after EVERY agent session ("after each session, gt submit"), not just
+ * when a PR is missing: the agent may have submitted the PR itself mid-
+ * session, the pipeline may have added a leftovers commit afterward, and a
+ * fixer attempt rewrites the branch entirely -- unconditionally (re)submitting
+ * converges all of those to "the PR matches the branch". `gt submit` is
+ * idempotent and handles force-pushes for rewritten branches; the plain-git
+ * path force-pushes explicitly (with lease) and creates the PR only if none
+ * exists.
  */
-export async function submitPullRequest(input: {
+export async function submitPhaseBranch(input: {
   worktreePath: string;
   branch: string;
   parentRef: string;
@@ -246,33 +302,33 @@ export async function submitPullRequest(input: {
   title: string;
   draft: boolean;
 }): Promise<{ url: string; number: number }> {
-  const existing = await getPullRequestForBranch(input.repo, input.branch);
-  if (existing) return existing;
-
   if (input.stackTool === "graphite") {
     const args = ["submit", "--no-interactive", "--no-edit", "--quiet"];
     if (input.draft) args.push("--draft");
     await gt(args, input.worktreePath);
   } else {
-    await git(["push", "-u", input.remote, input.branch], { cwd: input.worktreePath });
-    await gh(
-      [
-        "pr",
-        "create",
-        "--base",
-        input.parentRef,
-        "--head",
-        input.branch,
-        "--title",
-        input.title,
-        "--body",
-        "Opened by issue-pipeline; description follows shortly.",
-        "-R",
-        `${input.repo.owner}/${input.repo.repo}`,
-        ...(input.draft ? ["--draft"] : []),
-      ],
-      input.worktreePath,
-    );
+    await git(["push", "-u", input.remote, input.branch, "--force-with-lease"], { cwd: input.worktreePath });
+    const existing = await getPullRequestForBranch(input.repo, input.branch);
+    if (!existing) {
+      await gh(
+        [
+          "pr",
+          "create",
+          "--base",
+          input.parentRef,
+          "--head",
+          input.branch,
+          "--title",
+          input.title,
+          "--body",
+          "Opened by issue-pipeline; description follows shortly.",
+          "-R",
+          `${input.repo.owner}/${input.repo.repo}`,
+          ...(input.draft ? ["--draft"] : []),
+        ],
+        input.worktreePath,
+      );
+    }
   }
 
   const pr = await getPullRequestForBranch(input.repo, input.branch);
