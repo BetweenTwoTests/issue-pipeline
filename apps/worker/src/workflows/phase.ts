@@ -147,6 +147,12 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
       prompt,
       cwd: worktree.worktreePath,
       config,
+      context: {
+        repoSlug,
+        issueNumber: input.issueNumber,
+        phaseNumber,
+        attempt,
+      },
     });
 
     if (!agentResult.ok) {
@@ -171,7 +177,12 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
 
     // Worklogs land on the root issue (labeled by phase) -- they are the
     // handoff context the NEXT phase's session reads via `gh issue view`.
-    await postPhaseWorklogComment(repo, input.issueNumber, phaseNumber, input.totalPhases, worklog);
+    // The session footer ties the comment to its Claude Code transcript.
+    await postPhaseWorklogComment(repo, input.issueNumber, phaseNumber, input.totalPhases, worklog, {
+      sessionId: typeof agentResult.meta?.sessionId === "string" ? agentResult.meta.sessionId : null,
+      costUsd: typeof agentResult.meta?.costUsd === "number" ? agentResult.meta.costUsd : null,
+      numTurns: typeof agentResult.meta?.numTurns === "number" ? agentResult.meta.numTurns : null,
+    });
     // "Immediately file discovered tasks": every out-of-scope task the agent
     // reported becomes a sub-issue of the root issue, recording which phase
     // it came from -- the one remaining use of sub-issues in this system.

@@ -117,6 +117,34 @@ Progress is visible in the Temporal UI (workflow history, and the executor's
 last output line via heartbeat) and on the GitHub issue itself (checklist,
 comments, labels).
 
+## Viewing agent session transcripts
+
+Every planner/executor/fixer run is a real `claude -p` session, and Claude
+Code itself already stores the full transcript — every message, tool call,
+and result — in its session store
+(`~/.claude/projects/<cwd-derived-dir>/<session-id>.jsonl`). The pipeline
+adds the mapping layer: each run appends a line to
+`~/pipelines/agent-sessions.jsonl` (repo, issue, phase, role, attempt,
+session id, cost, turns), and each phase's worklog comment on the issue
+carries its session id and cost.
+
+```bash
+just viewer   # read-only transcript UI at http://127.0.0.1:8844
+```
+
+The viewer lists sessions grouped by repo/issue with role + phase/attempt
+badges, and renders the full transcript (prompt, Claude's messages, thinking,
+collapsible tool calls/results). It live-tails sessions that are still
+running. Sessions from before the index existed (or whose index write
+failed) are discovered by scanning the session store for pipeline-shaped
+worktree paths and shown as "unindexed". Localhost-only by design —
+transcripts contain source code and issue text.
+
+To re-open a session interactively instead of viewing it, run
+`claude --resume <session-id>` from that session's worktree directory
+(works only while the worktree still exists — they're cleaned up when the
+issue completes).
+
 ## Development
 
 ```bash
@@ -128,7 +156,8 @@ Package layout: `packages/core` (types/schemas/signals, no I/O — safe to
 import from Temporal workflow code), `packages/adapters` (the claude CLI
 wrapper + prompt templates), `packages/activities` (GitHub/git/gates, the
 actual I/O layer), `apps/worker` (the Temporal worker + `issue.ts`/
-`phase.ts` workflows), `apps/cli` (the `pipe` command).
+`phase.ts` workflows), `apps/cli` (the `pipe` command), `apps/viewer` (the
+local transcript viewer — reads local files only, never talks to Temporal).
 
 ## Troubleshooting
 

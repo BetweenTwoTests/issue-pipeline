@@ -30,7 +30,13 @@ export {
   type IssueStatus,
 } from "./signals";
 
-export type { AgentRole, AdapterName, AgentResult } from "./contracts/agent";
+export type {
+  AgentRole,
+  AdapterName,
+  AgentResult,
+  AgentSessionContext,
+  AgentSessionRecord,
+} from "./contracts/agent";
 export type { WorklogStatus, WorklogSections } from "./contracts/worklog";
 export {
   PipelineConfigError,
@@ -62,6 +68,7 @@ export {
   buildPhaseBranchName,
   buildPhaseWorktreePath,
   buildPlanningWorktreePath,
+  buildAgentSessionsIndexPath,
   type RegisteredRepo,
 } from "./contracts/repo";
 export {

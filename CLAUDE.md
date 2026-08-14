@@ -44,6 +44,7 @@ just infra-up   # Postgres + Temporal + Temporal UI (Docker, isolated ports 5433
 just worker     # Temporal worker (tsx watch — restart it manually after changing packages/activities
                 # or packages/adapters; watch mode doesn't reliably pick up dependency dist/ rebuilds)
 just pipe <args>  # the `pipe` CLI (builds apps/cli first, then runs it) -- e.g. `just pipe status`
+just viewer     # agent-session transcript viewer, http://127.0.0.1:8844 (read-only, local files only)
 ```
 `just pipe`'s argument passthrough does not preserve quoting for multi-word
 text (`answer`'s `<text>`, any `--note`) — for those, run
@@ -52,10 +53,12 @@ text (`answer`'s `<text>`, any `--note`) — for those, run
 
 ## Architecture
 
-Turborepo monorepo, five packages with a strict one-way dependency graph:
+Turborepo monorepo with a strict one-way dependency graph:
 `apps/worker` → `packages/activities` → `packages/adapters` → `packages/core`;
 `apps/cli` → `packages/core` only (the CLI talks to Temporal purely via
-`@temporalio/client` — it never imports activities).
+`@temporalio/client` — it never imports activities); `apps/viewer` →
+`packages/core` only (reads the local session index + Claude Code's own
+transcript store; no Temporal, no network beyond serving 127.0.0.1).
 
 **The determinism constraint that matters more than the dependency graph
 diagram suggests:** `apps/worker/src/workflows/*.ts` (`issue.ts`, `phase.ts`)

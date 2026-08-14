@@ -431,7 +431,61 @@ mode this layer exists to prevent:
   would kill a legitimately-still-running multi-minute agent process for
   "missing heartbeat" regardless of actual progress.
 
-## 10. Workflow ID reuse policy
+## 10. Session transcripts & the viewer (apps/viewer)
+
+**Decision: reuse Claude Code's own session store instead of capturing
+transcripts ourselves.** Every `claude -p` invocation already persists its
+full transcript — prompt, every assistant message, every tool call/result —
+to `~/.claude/projects/<cwd-derived-dir>/<sessionId>.jsonl` (verified
+against real files this pipeline produced; the dir name is the session's
+cwd with `/`, `.`, etc. munged to `-`). Capturing a second copy (e.g. via
+`--output-format stream-json`) would duplicate megabytes per session and
+touch the battle-tested adapter for no information gain. Transcripts are
+also far too big for GitHub comments (65k char limit), so they stay local
+by design — GitHub carries the *pointers*.
+
+What the pipeline adds is the mapping layer:
+- **`~/pipelines/agent-sessions.jsonl`** (path helper in core, writer in
+  `activities/src/session-index.ts`): one `AgentSessionRecord` line per
+  `runAgent` call — repo/issue/phase/role/attempt, workflowId, sessionId,
+  cwd, ok, cost, turns. Written **best-effort** (a failed append never fails
+  the phase) and written even for crashed runs (sessionId null) so a stage
+  with three failed attempts shows three rows, not zero. Lives beside the
+  worktrees, not in one, so it survives worktree cleanup.
+- **Worklog comments carry a session footer** (`_Agent session `<id>` ·
+  $0.42 · 12 turns_`) so the issue page links each phase to its transcript.
+
+**The viewer** (`just viewer`, http://127.0.0.1:8844) is a zero-dependency
+`node:http` server + single embedded HTML page (no build assets to copy, no
+CDN). `apps/viewer` → core only — it reads local files and never talks to
+Temporal. Sessions come from the index, plus a **discovery sweep** over the
+session store for pipeline-shaped dir names (`...-pipelines-<repo>-phases-
+<n>-p<k>` / `-planning` / the legacy `--repo` planner cwd) so pre-index
+sessions and index-write failures still show up, labeled "unindexed".
+
+Hard-won details baked into it:
+- The transcript format is Claude Code's **internal** storage, not an API —
+  the parser (`transcript.ts`, unit-tested against fixtures copied from
+  real files) skips unknown line types, falls back to raw JSON for unknown
+  blocks, and counts malformed lines instead of dying. If a claude release
+  changes the format, refresh the fixtures from a fresh real file.
+- Binds **127.0.0.1 only** — transcripts contain target-repo source and
+  issue text. The session-id query param doubles as a filename; the strict
+  UUID-shape check is what makes path traversal impossible.
+- The live tail re-renders the DOM **only when the transcript file grew**
+  (`rawLength` change detector) — the first version re-rendered every poll,
+  which silently re-collapsed every `<details>` the user had opened (a real
+  bug caught during in-browser verification, not code review).
+- `gt parent --quiet` suppresses stdout, so "is this branch tracked" checks
+  must read the **exit code**, not output text (bit the git.test.ts
+  assertions during this work).
+
+Interactive alternative: `claude --resume <session-id>` from the session's
+worktree reopens it as a live conversation — only while the worktree still
+exists (cleanup removes it when the issue completes), and only from that
+directory (Claude Code scopes sessions by cwd).
+
+## 11. Workflow ID reuse policy
 
 `pipe start` uses `WorkflowIdReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY`, not
 `REJECT_DUPLICATE`. This was a real bug in the first version: `REJECT_
@@ -447,7 +501,7 @@ unaffected either way — `signalWithStart` just delivers the signal to it.
 (Continue-as-new is unaffected too: the new execution continues under the
 same workflow ID as part of the same execution chain.)
 
-## 11. Local infra (docker/docker-compose.yml)
+## 12. Local infra (docker/docker-compose.yml)
 
 Postgres (`ipl-postgres`, 5433), Temporal (`ipl-temporal`, 7833),
 Temporal UI (`ipl-temporal-ui`, 8833) — all on non-default ports so this
@@ -465,7 +519,7 @@ which resolves correctly via Docker's embedded DNS even from within the
 same container: `["CMD", "temporal", "operator", "cluster", "health",
 "--address", "temporal:7233"]`.
 
-## 12. Roadmap: what upgrading this next actually involves
+## 13. Roadmap: what upgrading this next actually involves
 
 **M4 — event bridge.** The design this was scoped against calls for a
 60-second polling `BridgePollWorkflow` (Temporal Schedules can only start

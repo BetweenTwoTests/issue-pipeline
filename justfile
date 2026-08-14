@@ -27,6 +27,10 @@ up: infra-up worker
 worker:
     pnpm --filter @issue-pipeline/worker dev
 
+# Agent-session transcript viewer (read-only, http://127.0.0.1:8844)
+viewer:
+    pnpm --filter @issue-pipeline/viewer dev
+
 # Build every package/app
 build:
     pnpm turbo run build

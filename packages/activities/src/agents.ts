@@ -3,6 +3,8 @@ import * as path from "node:path";
 import {
   type AgentResult,
   type AgentRole,
+  type AgentSessionContext,
+  type AgentSessionRecord,
   type PipelineConfig,
   type PlannerOutput,
   type RegisteredRepo,
@@ -21,6 +23,7 @@ import {
   type FixerPromptInput,
 } from "@issue-pipeline/adapters";
 import { createDiscoveredTaskIssue } from "./github";
+import { appendAgentSessionRecord, defaultAgentSessionsIndexPath } from "./session-index";
 
 /**
  * Workflow code must never import @issue-pipeline/adapters directly -- doing
@@ -45,6 +48,9 @@ export interface RunAgentInput {
   prompt: string;
   cwd: string;
   config: PipelineConfig;
+  /** Which stage of which pipeline this session belongs to -- recorded in
+   * the agent-session index so transcripts can be found per stage. */
+  context?: AgentSessionContext;
 }
 
 // The planner runs in Claude Code's read-only "plan" mode -- it explores the
@@ -59,17 +65,56 @@ const DEFAULT_PERMISSION_MODE: Record<AgentRole, string> = {
   fixer: "bypassPermissions",
 };
 
+/** Same deferred-require trick as adapters/process.ts: activities are
+ * callable outside a real Temporal activity context (tests), where
+ * Context.current() throws. */
+function tryGetWorkflowId(): string | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { Context } = require("@temporalio/activity") as typeof import("@temporalio/activity");
+    return Context.current().info?.workflowExecution?.workflowId ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Claude only: the codex adapter was removed when this pipeline went
  * single-vendor (single-issue redesign). role.adapter survives in config as
  * a claude-only enum so an old codex config fails loudly at parse time. */
 export async function runAgent(input: RunAgentInput): Promise<AgentResult> {
   const roleConfig = input.config.roles[input.role];
-  return runClaude({
+  const startedAt = new Date().toISOString();
+  const result = await runClaude({
     prompt: input.prompt,
     cwd: input.cwd,
     role: roleConfig,
     defaultPermissionMode: DEFAULT_PERMISSION_MODE[input.role],
   });
+
+  // Observability must never fail the pipeline: the index append is
+  // best-effort. Records are written even for crashed runs (sessionId may
+  // be null then) -- a stage with three failed attempts should show three
+  // entries in the viewer, not zero.
+  if (input.context) {
+    try {
+      const record: AgentSessionRecord = {
+        ...input.context,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        role: input.role,
+        workflowId: tryGetWorkflowId(),
+        sessionId: typeof result.meta?.sessionId === "string" ? result.meta.sessionId : null,
+        cwd: input.cwd,
+        ok: result.ok,
+        costUsd: typeof result.meta?.costUsd === "number" ? result.meta.costUsd : null,
+        numTurns: typeof result.meta?.numTurns === "number" ? result.meta.numTurns : null,
+      };
+      await appendAgentSessionRecord(defaultAgentSessionsIndexPath(), record);
+    } catch {
+      // best-effort by design
+    }
+  }
+  return result;
 }
 
 /**

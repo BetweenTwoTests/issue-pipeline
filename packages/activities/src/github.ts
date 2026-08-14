@@ -184,16 +184,31 @@ export async function postComment(repo: RegisteredRepo, issueNumber: number, bod
   return { url: url.trim() };
 }
 
+export interface WorklogSessionMeta {
+  sessionId?: string | null;
+  costUsd?: number | null;
+  numTurns?: number | null;
+}
+
 /** Worklogs land on the ROOT issue now (there are no phase sub-issues), so
  * each one is labeled with the phase it belongs to -- both for humans and
- * for later phases' sessions, whose prompt tells them to read these. */
+ * for later phases' sessions, whose prompt tells them to read these. The
+ * optional session footer ties the comment to the Claude Code session that
+ * produced it (viewable locally via `just viewer`). */
 export async function postPhaseWorklogComment(
   repo: RegisteredRepo,
   issueNumber: number,
   phaseNumber: number,
   totalPhases: number,
   worklog: WorklogSections,
+  session?: WorklogSessionMeta,
 ): Promise<{ url: string }> {
+  const footerParts: string[] = [];
+  if (session?.sessionId) footerParts.push(`session \`${session.sessionId}\``);
+  if (typeof session?.costUsd === "number") footerParts.push(`$${session.costUsd.toFixed(2)}`);
+  if (typeof session?.numTurns === "number") footerParts.push(`${session.numTurns} turns`);
+  const footer = footerParts.length > 0 ? `\n\n---\n_Agent ${footerParts.join(" · ")}_` : "";
+
   const body = `## Phase ${phaseNumber}/${totalPhases} worklog (status: ${worklog.status})
 
 ### Done
@@ -209,7 +224,7 @@ ${worklog.surprisesFindings}
 ${worklog.followUps}
 
 ### Discovered tasks
-${worklog.discoveredTasks}`;
+${worklog.discoveredTasks}${footer}`;
   return postComment(repo, issueNumber, body);
 }
 

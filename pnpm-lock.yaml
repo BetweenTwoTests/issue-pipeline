@@ -46,6 +46,16 @@ importers:
         specifier: ^4.19.2
         version: 4.23.12
 
+  apps/viewer:
+    dependencies:
+      '@issue-pipeline/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+    devDependencies:
+      tsx:
+        specifier: ^4.19.2
+        version: 4.23.12
+
   apps/worker:
     dependencies:
       '@issue-pipeline/activities':

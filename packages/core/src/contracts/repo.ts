@@ -41,3 +41,12 @@ export function buildPlanningWorktreePath(
 ): string {
   return `${homeDir}/pipelines/${repoName}/phases/${rootIssueNumber}/planning`;
 }
+
+/**
+ * The agent-session index (JSONL, one AgentSessionRecord per line). Lives
+ * beside the worktrees, NOT inside any of them -- it must survive worktree
+ * cleanup after an issue completes.
+ */
+export function buildAgentSessionsIndexPath(homeDir: string): string {
+  return `${homeDir}/pipelines/agent-sessions.jsonl`;
+}

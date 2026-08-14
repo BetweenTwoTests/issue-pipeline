@@ -19,3 +19,35 @@ export interface AgentResult {
   raw?: string;
   meta?: Record<string, unknown>;
 }
+
+/** Where in the pipeline an agent session ran -- attached to runAgent calls
+ * so the session can be tied back to its stage. */
+export interface AgentSessionContext {
+  /** "owner/repo". */
+  repoSlug: string;
+  issueNumber: number;
+  /** 1-based; null for planner sessions. */
+  phaseNumber: number | null;
+  /** Fixer attempt number for executor/fixer (0 = the executor run), or the
+   * planning round for planner sessions (1 = first plan). */
+  attempt: number;
+}
+
+/**
+ * One line of ~/pipelines/agent-sessions.jsonl -- the durable index mapping
+ * every agent CLI invocation to its Claude Code session id, which is the key
+ * into Claude Code's own transcript store
+ * (~/.claude/projects/<cwd-derived-dir>/<sessionId>.jsonl). Written
+ * best-effort by runAgent; read by the transcript viewer (apps/viewer).
+ */
+export interface AgentSessionRecord extends AgentSessionContext {
+  startedAt: string;
+  finishedAt: string;
+  role: AgentRole;
+  workflowId: string | null;
+  sessionId: string | null;
+  cwd: string;
+  ok: boolean;
+  costUsd: number | null;
+  numTurns: number | null;
+}

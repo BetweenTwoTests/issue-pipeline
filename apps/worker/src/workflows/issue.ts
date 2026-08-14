@@ -202,6 +202,12 @@ export async function issueWorkflow(input: IssueWorkflowInput): Promise<IssueWor
         prompt,
         cwd: planningWorktree.worktreePath,
         config,
+        context: {
+          repoSlug: `${input.owner}/${input.repo}`,
+          issueNumber: input.issueNumber,
+          phaseNumber: null,
+          attempt: planningRound,
+        },
       });
       decomposition = await parsePlannerOutput(agentResult.summary);
 
