@@ -87,7 +87,7 @@ pipeline's first step). Then, in another terminal:
 
 ```bash
 just pipe start https://github.com/my-org/my-repo/issues/123
-just pipe status https://github.com/my-org/my-repo/issues/123   # live stage/phases/PRs
+just pipe status https://github.com/my-org/my-repo/issues/123   # live stage/phases/PRs (no arg: connectivity check)
 just pipe check  https://github.com/my-org/my-repo/issues/123   # poll PR merge states now
 just pipe resume https://github.com/my-org/my-repo/issues/123   # retry a parked phase
 just pipe skip   https://github.com/my-org/my-repo/issues/123   # skip a parked phase
@@ -158,9 +158,14 @@ docker exec ipl-temporal temporal workflow list --address temporal:7233 --namesp
 docker exec ipl-temporal temporal workflow show --address temporal:7233 --namespace issue-pipeline --workflow-id pipeline-my-org-my-repo-123-phase-0-r0
 ```
 
-Add `--run-id` to target an earlier execution: re-running `pipe start` on the
-same root issue reuses the same workflow ID, and a bare `--workflow-id`
-resolves to the latest one.
+Add `--run-id` to target an earlier execution — a bare `--workflow-id`
+resolves to the latest run, and one workflow ID accumulates runs two ways:
+re-running `pipe start` after a failed execution, and the merge-wait loop's
+continue-as-new, which by design rolls a long-lived issue workflow onto a
+fresh run with fresh history. On an issue that's been sitting in merge-wait,
+the planning events (and the links to the phase children) live in the
+*earlier* runs, not the latest one; the UI's run list on the workflow page
+gets you to them.
 
 `--output json` gives the full history machine-readably, but every payload
 comes back base64-encoded (the UI decodes them; the CLI doesn't). To pull the
@@ -182,8 +187,11 @@ agent ran in determines where its session lands — the path is flattened with
   `~/.claude/projects/-Users-<you>-pipelines-<repo>-phases-<issue>-planning/<session-id>.jsonl`
 
 The `.jsonl` is the whole turn-by-turn transcript: every tool call and file
-edit. To read it interactively instead, resume it from the same directory it
-ran in (a session resumed from anywhere else won't be found):
+edit. Transcripts outlive the worktrees — they're not touched by
+`cleanupIssueWorktrees`. To read one interactively instead, resume it from
+the same directory the agent ran in (Claude Code looks sessions up by cwd,
+so a session resumed from anywhere else won't be found; if the issue already
+closed and the worktree was cleaned up, `mkdir -p` the path first):
 
 ```bash
 cd ~/pipelines/my-repo/phases/123/p1 && claude --resume <session-id>
@@ -197,8 +205,9 @@ phase), where `<repo-key>` is the key under `repos:` in `pipeline.yaml`.
 Each phase worktree sits on its phase branch with the executor's commits and
 a `WORKLOG.md.processed` — the phase's WORKLOG contract file, renamed once
 the workflow consumed it. `git log`, `git diff <parent-branch>`, and
-`gt log` all work there. On successful close (or abort),
-`cleanupIssueWorktrees` removes them; the bare clone stays.
+`gt log` all work there. When the issue closes as completed,
+`cleanupIssueWorktrees` removes them (the bare clone stays); an aborted or
+parked pipeline leaves them in place.
 
 On GitHub everything lands on the root issue: the plan, Q&A, per-phase
 worklog comments (`## Phase k/N worklog`), park explanations, and merge-wait
