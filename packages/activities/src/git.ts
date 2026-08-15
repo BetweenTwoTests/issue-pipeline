@@ -215,9 +215,10 @@ export async function commitWorktreeChanges(input: {
       await gt(["modify", "-a", "-m", input.message, "--no-interactive", "--quiet"], input.worktreePath);
       return { committed: true };
     } catch (err) {
-      // Best-effort: exact wording for Graphite's "nothing staged" case is
-      // not yet verified against a live gt invocation -- broadened match,
-      // re-throws anything that doesn't look like this specific case.
+      // Best-effort: the patterns are a guess at Graphite's "nothing
+      // staged" wording, not taken from an observed gt transcript -- hence
+      // the deliberately broad match; anything that doesn't look like this
+      // specific case is re-thrown.
       const stderr = isExecFileError(err) ? (err.stderr ?? err.message) : String(err);
       if (/nothing to commit|no changes|nothing staged/i.test(stderr)) {
         return { committed: false };

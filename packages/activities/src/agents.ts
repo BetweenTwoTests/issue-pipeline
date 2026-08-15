@@ -159,9 +159,9 @@ function splitSections(raw: string): Record<string, string> {
   const sections: Record<string, string> = {};
   const parts = raw.split(/\n(?=##\s+)/);
   for (const part of parts) {
-    // [^\n]+ (not the non-greedy .+? this used to be): the old pattern's
-    // tail (\s*\n?) could match zero characters, so the non-greedy capture
-    // stopped after a single character ("D" instead of "Done").
+    // [^\n]+, not a non-greedy .+?: the \n? that follows can match zero
+    // characters, so a non-greedy capture would stop after a single
+    // character ("D" instead of "Done").
     const headerMatch = part.match(/^##\s+([^\n]+)\n?/);
     if (!headerMatch) continue;
     const header = headerMatch[1].trim();

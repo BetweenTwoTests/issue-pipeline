@@ -96,11 +96,11 @@ test("createPhaseWorktree recreates a stale worktree left detached by an interru
       // as far as `git worktree add --detach` but never reached the branch
       // checkout step -- e.g. an activity retry after a transient `gt
       // create`/`git checkout -b` failure, or a worker restart mid-activity.
-      // Verified against a real production failure: reusing this blindly
-      // (the old behavior) silently hands back a worktree with no branch
-      // checked out, which only surfaces much later as an opaque "Cannot
-      // perform this operation without a branch checked out" from `gt
-      // modify`, deterministically, on every subsequent retry.
+      // Verified against a real production failure: reusing this as-is
+      // silently hands back a worktree with no branch checked out, which
+      // only surfaces much later as an opaque "Cannot perform this
+      // operation without a branch checked out" from `gt modify`,
+      // deterministically, on every subsequent retry.
       const worktreePath = path.join(os.homedir(), "pipelines", repo.name, "phases", "3", "p1");
       await fs.mkdir(path.dirname(worktreePath), { recursive: true });
       await runCommand("git", ["worktree", "add", "--detach", worktreePath, "main"], { cwd: repo.localPath });
