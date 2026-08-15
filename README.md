@@ -98,6 +98,92 @@ Progress is visible in the Temporal UI (workflow history, and the executor's
 last output line via heartbeat) and as comments/labels on the GitHub issues
 themselves.
 
+## Inspecting a run
+
+A finished (or parked) run leaves its trail in four places: Temporal history,
+the phase worktrees on disk, the Claude session transcripts, and the GitHub
+issues/PRs. There's no `pipe` subcommand for any of this — `pipe status` only
+checks namespace connectivity.
+
+Workflow IDs are derived, not random, so you can construct them:
+
+- plan: `pipeline-<owner>-<repo>-<root-issue-number>`
+- phase: `<plan-id>-phase-<0-based-index>-r<retry-generation>` — e.g.
+  `pipeline-my-org-my-repo-123-phase-0-r0` is phase 1's first run; `-r1` is
+  the same phase re-run after a `pipe resume`.
+
+### Temporal history
+
+The UI is the fastest way to read a run, since it decodes activity
+inputs/outputs for you. Deep-link straight to a plan workflow (no run ID
+needed — it resolves to the latest run of that ID):
+
+```bash
+open http://localhost:8833/namespaces/issue-pipeline/workflows/pipeline-my-org-my-repo-123
+```
+
+Its **Relationships** tab links the per-phase child workflows. In a phase's
+**Event History**, each `runAgent` result carries the agent's full summary
+plus `meta.sessionId` / `costUsd` / `numTurns`; a failed activity's failure
+event carries the agent's stdout.
+
+There's no `temporal` CLI on the host — it ships inside the server image, so
+shell into that container, and address the server by its compose name
+(`temporal:7233`), not the host-side port:
+
+```bash
+docker exec ipl-temporal temporal workflow list --address temporal:7233 --namespace issue-pipeline
+```
+
+```bash
+docker exec ipl-temporal temporal workflow show --address temporal:7233 --namespace issue-pipeline --workflow-id pipeline-my-org-my-repo-123-phase-0-r0
+```
+
+Add `--run-id` to target an earlier execution: re-running `pipe start` on the
+same root issue reuses the same workflow ID, and a bare `--workflow-id`
+resolves to the latest one.
+
+`--output json` gives the full history machine-readably, but every payload
+comes back base64-encoded (the UI decodes them; the CLI doesn't). To pull the
+agent results — session ID, cost, turn count — out of one phase:
+
+```bash
+docker exec ipl-temporal temporal workflow show --address temporal:7233 --namespace issue-pipeline --workflow-id pipeline-my-org-my-repo-123-phase-0-r0 --output json | jq -r '[.events[] | select(.eventType=="EVENT_TYPE_ACTIVITY_TASK_SCHEDULED" and .activityTaskScheduledEventAttributes.activityType.name=="runAgent") | .eventId] as $ids | .events[] | select(.eventType=="EVENT_TYPE_ACTIVITY_TASK_COMPLETED" and (.activityTaskCompletedEventAttributes.scheduledEventId | IN($ids[]))) | .activityTaskCompletedEventAttributes.result.payloads[0].data' | base64 -d | jq '{ok, summary, meta}'
+```
+
+### Agent session transcripts
+
+Claude Code stores transcripts per working directory, so which directory an
+agent ran in determines where its session lands — the path is flattened with
+`/` and `.` both becoming `-`:
+
+- executor and fixer run in the phase worktree →
+  `~/.claude/projects/-Users-<you>-pipelines-<repo>-phases-<root-issue>-p<N>/<session-id>.jsonl`
+- the planner runs in the bare clone →
+  `~/.claude/projects/-Users-<you>-pipelines-<repo>--repo/<session-id>.jsonl`
+  (doubled dash — `.repo` flattens to `-repo`)
+
+The `.jsonl` is the whole turn-by-turn transcript: every tool call and file
+edit. To read it interactively instead, resume it from the same directory it
+ran in (a session resumed from anywhere else won't be found):
+
+```bash
+cd ~/pipelines/my-repo/phases/123/p1 && claude --resume <session-id>
+```
+
+### Worktrees and GitHub
+
+Phase worktrees are left in place after a run: `~/pipelines/<repo-key>/phases/
+<root-issue>/p<N>`, where `<repo-key>` is the key under `repos:` in
+`pipeline.yaml`. Each sits on its phase branch with the executor's commits and
+a `WORKLOG.md.processed` — the phase's WORKLOG contract file, renamed once the
+workflow consumed it. `git log`, `git diff <parent-branch>`, and `gt log` all
+work there.
+
+On GitHub: each phase's WORKLOG is posted as a comment on that phase's
+sub-issue, and a parked pipeline labels the root issue `pipeline:stalled` and
+comments there with the failure reason.
+
 ## Adapters
 
 Each role (`planner`, `executor`, `fixer`) in `pipeline.yaml` maps
