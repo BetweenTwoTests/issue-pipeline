@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "transcript-viewer",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@issue-pipeline/transcript-viewer", "dev"],
+      "port": 8845
+    }
+  ]
+}

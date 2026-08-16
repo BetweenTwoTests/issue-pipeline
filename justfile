@@ -31,6 +31,10 @@ worker:
 build:
     pnpm turbo run build
 
+# Web viewer for Claude Code session transcripts (http://127.0.0.1:8845)
+transcripts:
+    pnpm --filter @issue-pipeline/transcript-viewer dev
+
 # Run a one-off `pipe` CLI command, e.g. `just pipe status` or
 # `just pipe start https://github.com/owner/repo/issues/123`.
 # (direct node invocation, not `pnpm exec pipe` -- pnpm does not self-link a

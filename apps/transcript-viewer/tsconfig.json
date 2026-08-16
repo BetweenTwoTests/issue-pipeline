@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Vite owns emit (client bundle to dist/); tsc is typecheck-only here,
+    // unlike the tsc-emitting sibling packages.
+    "noEmit": true,
+    "declaration": false,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "lib": ["es2023", "dom", "dom.iterable"]
+  },
+  "include": ["src", "vite.config.ts"]
+}
