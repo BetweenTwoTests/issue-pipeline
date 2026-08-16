@@ -203,6 +203,30 @@ body {
   border-color: var(--accent);
 }
 
+.btn-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-copy svg {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.btn-copy:hover svg {
+  color: var(--accent);
+}
+
+.btn-copy.copied,
+.btn-copy.copied svg {
+  color: var(--ok);
+}
+
+.btn-copy.copied {
+  border-color: var(--ok);
+}
+
 .chips {
   display: flex;
   flex-wrap: wrap;

@@ -6,6 +6,7 @@ import {
   type PipelineConfig,
   type PlannerOutput,
   type WorklogSections,
+  buildTranscriptUrl,
   PlannerOutputSchema,
   PlannerOutputParseError,
   WorklogContractViolationError,
@@ -97,6 +98,25 @@ const DEFAULT_PERMISSION_MODE: Record<AgentRole, string> = {
   executor: "bypassPermissions",
   fixer: "bypassPermissions",
 };
+
+/** The transcript viewer's own default port (apps/transcript-viewer). */
+const DEFAULT_VIEWER_URL = "http://localhost:8845";
+
+/**
+ * Markdown footer linking an agent run's session transcript in the local
+ * viewer (`just transcripts`). Empty when the run reported no session id
+ * (codex has no session concept; a crashed claude run may report none) --
+ * callers append the result verbatim. The base URL comes from
+ * PIPELINE_VIEWER_URL so links track wherever the viewer listens; they
+ * resolve only on the operator's machine, matching the viewer's
+ * loopback-only design.
+ */
+export async function buildTranscriptFooter(input: { cwd: string; sessionId?: string }): Promise<string> {
+  if (!input.sessionId) return "";
+  const configured = process.env.PIPELINE_VIEWER_URL?.trim();
+  const url = buildTranscriptUrl(configured || DEFAULT_VIEWER_URL, input.cwd, input.sessionId);
+  return `\n\n---\n[Agent session transcript](${url}) (local viewer: \`just transcripts\`)`;
+}
 
 export async function runAgent(input: RunAgentInput): Promise<AgentResult> {
   const roleConfig = input.config.roles[input.role];

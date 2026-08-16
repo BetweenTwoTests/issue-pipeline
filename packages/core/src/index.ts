@@ -26,7 +26,8 @@ export {
   type PlanStatus,
 } from "./signals";
 
-export type { AgentRole, AdapterName, AgentResult } from "./contracts/agent";
+export { agentSessionId, type AgentRole, type AdapterName, type AgentResult } from "./contracts/agent";
+export { claudeProjectDirName, buildTranscriptUrl } from "./transcript-link";
 export type { WorklogStatus, WorklogSections } from "./contracts/worklog";
 export {
   PipelineConfigError,
