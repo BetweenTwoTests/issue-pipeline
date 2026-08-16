@@ -34,11 +34,40 @@ export type PlanWorkflowState =
   | "done"
   | "aborted";
 
+export interface PlanQuestionStatus {
+  /** 1-based, matching the numbering in the pipeline's issue comment. */
+  index: number;
+  question: string;
+  /** The planner's own recommendation, usable as a suggested answer. */
+  proposedAnswer: string;
+  answered: boolean;
+}
+
+export interface PlanPhaseStatus {
+  subIssueNumber: number;
+  title: string;
+  status: "pending" | "done" | "parked";
+  headBranch: string | null;
+}
+
+/**
+ * Everything a human-in-the-loop surface (the CLI, the transcript viewer's
+ * pipelines panel) needs to render a pipeline and decide what response to
+ * send -- which blocking questions are still open, and which phase is
+ * parked. Answering/resuming happens via the signals below, never by
+ * mutating this.
+ */
 export interface PlanStatus {
   status: PlanWorkflowState;
+  owner: string;
+  repo: string;
+  issueNumber: number;
   currentIndex: number;
   totalPhases: number;
   headBranch: string | null;
+  /** Empty until the planner raises blocking questions. */
+  blockingQuestions: PlanQuestionStatus[];
+  phases: PlanPhaseStatus[];
 }
 
 // Defined once here so both apps/worker (setHandler) and apps/cli (typed

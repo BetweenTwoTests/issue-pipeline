@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Worker } from "@temporalio/worker";
 import { TestWorkflowEnvironment } from "@temporalio/testing";
-import { abortSignal } from "@issue-pipeline/core";
+import { abortSignal, planStatusQuery } from "@issue-pipeline/core";
 import { parsePlannerOutput } from "@issue-pipeline/activities";
 import { planWorkflow, type PlanWorkflowInput, type PlanWorkflowResult } from "./plan";
 
@@ -79,10 +79,27 @@ test("planWorkflow: an abort signal during the blocking-questions wait ends the 
     });
 
     const result = (await worker.runUntil(async () => {
-      // Give the workflow a moment to reach the blocking-questions wait
-      // before aborting it -- otherwise the signal could arrive before the
-      // workflow has even registered its handler.
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Wait until the workflow reaches the blocking-questions wait before
+      // querying/aborting -- each mocked activity is still a real server
+      // round-trip, so poll instead of sleeping a fixed amount.
+      let status = await handle.query(planStatusQuery);
+      const deadline = Date.now() + 15_000;
+      while (status.status === "planning" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        status = await handle.query(planStatusQuery);
+      }
+
+      // The status query is the read side of the human-in-the-loop surface:
+      // it must expose the blocking questions (with answered flags) and the
+      // issue ref so a UI can render an answer form without GitHub access.
+      assert.equal(status.status, "awaiting_blocking_questions");
+      assert.equal(status.owner, "acme");
+      assert.equal(status.repo, "widgets");
+      assert.equal(status.issueNumber, 1);
+      assert.deepEqual(status.blockingQuestions, [
+        { index: 1, question: "Which database?", proposedAnswer: "", answered: false },
+      ]);
+
       await handle.signal(abortSignal, { note: "test abort" });
       return handle.result();
     })) as PlanWorkflowResult;

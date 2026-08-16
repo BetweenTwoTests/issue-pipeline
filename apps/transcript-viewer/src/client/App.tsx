@@ -1,26 +1,30 @@
 import { useCallback, useEffect, useState } from "react";
-import type { ProjectSummary, SessionSummary } from "../shared/types";
-import { fetchProjects, fetchSessions } from "./api";
+import type { PipelineListItem, ProjectSummary, SessionSummary } from "../shared/types";
+import { fetchPipelines, fetchProjects, fetchSessions } from "./api";
 import { formatBytes, formatWhen, shortHome } from "./format";
+import { PipelineView, statusClass, statusLabel } from "./PipelineView";
 import { TranscriptView } from "./TranscriptView";
 
 const PROJECTS_POLL_MS = 30_000;
 const SESSIONS_POLL_MS = 5_000;
+const PIPELINES_POLL_MS = 8_000;
 
 interface Route {
   project: string | null;
   session: string | null;
+  workflow: string | null;
 }
 
 function parseHash(): Route {
   const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
-  return { project: params.get("p"), session: params.get("s") };
+  return { project: params.get("p"), session: params.get("s"), workflow: params.get("w") };
 }
 
-function buildHash(project: string | null, session: string | null): string {
+function buildHash(project: string | null, session: string | null, workflow: string | null): string {
   const params = new URLSearchParams();
   if (project) params.set("p", project);
   if (session) params.set("s", session);
+  if (workflow) params.set("w", workflow);
   return `#${params.toString()}`;
 }
 
@@ -33,6 +37,8 @@ export default function App() {
   const [projectsError, setProjectsError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
+  const [pipelines, setPipelines] = useState<PipelineListItem[]>([]);
+  const [pipelinesError, setPipelinesError] = useState<string | null>(null);
   const [route, setRoute] = useState<Route>(() => parseHash());
 
   useEffect(() => {
@@ -42,13 +48,17 @@ export default function App() {
   }, []);
 
   const navigate = useCallback((project: string | null, session: string | null, replace = false) => {
-    const hash = buildHash(project, session);
+    const hash = buildHash(project, session, null);
     if (replace) {
       window.history.replaceState(null, "", hash);
       setRoute(parseHash());
     } else {
       window.location.hash = hash;
     }
+  }, []);
+
+  const navigateWorkflow = useCallback((workflowId: string) => {
+    window.location.hash = buildHash(parseHash().project, parseHash().session, workflowId);
   }, []);
 
   useEffect(() => {
@@ -72,12 +82,33 @@ export default function App() {
     };
   }, []);
 
-  // Landing with no project selected jumps to the most recently active one.
   useEffect(() => {
-    if (route.project === null && projects && projects.length > 0) {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const loaded = await fetchPipelines();
+        if (!cancelled) {
+          setPipelines(loaded);
+          setPipelinesError(null);
+        }
+      } catch (err) {
+        if (!cancelled) setPipelinesError(err instanceof Error ? err.message : String(err));
+      }
+    };
+    void load();
+    const interval = setInterval(() => void load(), PIPELINES_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  // Landing with nothing selected jumps to the most recently active project.
+  useEffect(() => {
+    if (route.project === null && route.workflow === null && projects && projects.length > 0) {
       navigate(projects[0].name, null, true);
     }
-  }, [route.project, projects, navigate]);
+  }, [route.project, route.workflow, projects, navigate]);
 
   useEffect(() => {
     setSessions(null);
@@ -112,6 +143,28 @@ export default function App() {
         <header className="sidebar-head">
           <h1>Claude transcripts</h1>
         </header>
+        {pipelines.length > 0 || pipelinesError ? (
+          <div className="pipelines-section">
+            <div className="section-title">Pipelines</div>
+            {pipelinesError ? <div className="notice notice-error">{pipelinesError}</div> : null}
+            {pipelines.map((p) => {
+              const label = statusLabel(p);
+              return (
+                <button
+                  key={p.workflowId}
+                  className={`session-item${p.workflowId === route.workflow ? " selected" : ""}`}
+                  onClick={() => navigateWorkflow(p.workflowId)}
+                >
+                  <span className="session-title">
+                    {p.plan ? `${p.plan.owner}/${p.plan.repo}#${p.plan.issueNumber}` : p.workflowId}{" "}
+                    <span className={`badge badge-${statusClass(label.replaceAll(" ", "_"))}`}>{label}</span>
+                  </span>
+                  <span className="session-sub">started {formatWhen(p.startTime)}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
         <div className="project-picker">
           {projectsError ? <div className="notice notice-error">{projectsError}</div> : null}
           <select
@@ -135,7 +188,7 @@ export default function App() {
           {(sessions ?? []).map((s) => (
             <button
               key={s.id}
-              className={`session-item${s.id === route.session ? " selected" : ""}`}
+              className={`session-item${s.id === route.session && !route.workflow ? " selected" : ""}`}
               onClick={() => navigate(route.project, s.id)}
             >
               <span className="session-title">
@@ -152,7 +205,9 @@ export default function App() {
         </div>
       </aside>
       <main className="main">
-        {route.project && route.session ? (
+        {route.workflow ? (
+          <PipelineView key={route.workflow} workflowId={route.workflow} />
+        ) : route.project && route.session ? (
           <TranscriptView
             key={`${route.project}/${route.session}`}
             project={route.project}

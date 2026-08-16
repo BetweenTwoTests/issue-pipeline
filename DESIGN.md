@@ -403,6 +403,22 @@ http://localhost:8845) feeds both the viewer's listen port and those links,
 so one variable moves both; the env read happens in the activity because
 workflow code cannot touch `process.env`.
 
+The viewer is also a human-in-the-loop surface (the "Pipelines" panel): it
+lists `planWorkflow` executions, reads each one's `planStatusQuery` (which
+exposes the blocking questions with answered flags, the phase list, and the
+issue ref precisely so a UI can render an answer form without GitHub
+access), and delivers responses as Temporal signals — `questionsAnswered`,
+`resume`, `skip`, `abort` — through `@temporalio/client` in
+`src/server/pipelines.ts`, exactly the CLI's mechanism. Never shell out to
+`pipe` for this: the workflow is the source of truth and the signal
+contracts live in core. Guards on the mutating POST endpoints: requests
+must be same-origin `application/json` (cross-origin callers hit a CORS
+preflight that fails, so a drive-by page cannot signal workflows through
+the loopback server), and status queries are raced against a 3s timeout
+because they hang forever when no worker is running. When
+TEMPORAL_ADDRESS/NAMESPACE are unset the panel returns 503 rather than
+defaulting to a bare address, matching the worker/CLI rule.
+
 Three decisions worth knowing before touching it:
 
 - **One process, loopback only.** The transcript API is Connect middleware

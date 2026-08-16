@@ -24,6 +24,8 @@ export {
   type AbortPayload,
   type PlanWorkflowState,
   type PlanStatus,
+  type PlanQuestionStatus,
+  type PlanPhaseStatus,
 } from "./signals";
 
 export { agentSessionId, type AgentRole, type AdapterName, type AgentResult } from "./contracts/agent";
