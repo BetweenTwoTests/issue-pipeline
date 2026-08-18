@@ -36,6 +36,7 @@ just infra-up   # Postgres + Temporal + Temporal UI (Docker, isolated ports 5433
 just worker     # Temporal worker (tsx watch — restart it manually after changing packages/activities
                 # or packages/adapters; watch mode doesn't reliably pick up dependency dist/ rebuilds)
 just pipe <args>  # the `pipe` CLI (builds apps/cli first, then runs it) -- e.g. `just pipe status`
+just transcripts  # web viewer for Claude session transcripts (~/.claude/projects) on http://127.0.0.1:8845
 ```
 `just pipe`'s argument passthrough does not preserve quoting for multi-word
 text (`answer`'s `<text>`, any `--note`) — for those, run
@@ -47,7 +48,11 @@ text (`answer`'s `<text>`, any `--note`) — for those, run
 Turborepo monorepo, five packages with a strict one-way dependency graph:
 `apps/worker` → `packages/activities` → `packages/adapters` → `packages/core`;
 `apps/cli` → `packages/core` only (the CLI talks to Temporal purely via
-`@temporalio/client` — it never imports activities).
+`@temporalio/client` — it never imports activities). A sixth workspace
+package, `apps/transcript-viewer`, sits outside the graph entirely — a
+React/Vite web viewer for Claude Code session transcripts that imports no
+workspace packages (see DESIGN.md §12; it is also the repo's only ESM/JSX
+package, so don't copy its tsconfig for a new backend package).
 
 **The determinism constraint that matters more than the dependency graph
 diagram suggests:** `apps/worker/src/workflows/*.ts` (`plan.ts`, `phase.ts`)

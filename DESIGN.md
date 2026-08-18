@@ -381,3 +381,36 @@ without weakening the "closed sub-issue = phase advanced" invariant the
 whole system leans on (§5) — reviewer-rejects should probably feed the
 existing fixer loop (a new `FailureReason` variant) rather than becoming a
 third, separate retry mechanism.
+
+## 12. Transcript viewer (apps/transcript-viewer)
+
+A standalone localhost web app for reading Claude Code session transcripts —
+interactive sessions and this pipeline's agent runs alike. It reads
+`~/.claude/projects/<cwd-derived-dir>/<sessionId>.jsonl` directly (Claude
+Code's internal store — undocumented, so the parser is deliberately
+defensive: unknown line/block types are skipped, malformed lines are counted
+and surfaced, never thrown on) and renders prompts, assistant text, thinking
+blocks, tool calls paired with their results by `tool_use_id`, and subagent
+sidechain groups. `just transcripts` → http://127.0.0.1:8845.
+
+Three decisions worth knowing before touching it:
+
+- **One process, loopback only.** The transcript API is Connect middleware
+  mounted inside Vite's own dev/preview server (`vite.config.ts`), so there
+  is no separate backend. The API serves the user's entire session store, so
+  the server must never listen on a routable interface (no `--host`). The
+  `project`/`id` query params double as path segments under the store root;
+  strict shape validation (directory-name charset, session UUID) is the
+  path-traversal guard.
+- **Live tail is byte-offset polling, and event ids must stay stable.** The
+  client polls `/api/session?offset=<bytes>` every 2s; the server returns
+  only complete new lines (a torn trailing write is held back until the next
+  poll, unless it already parses as complete JSON — a writer that just
+  hasn't newline-terminated yet). Event ids are `<entry uuid>:<block index>`
+  so React reconciliation preserves `<details>` open/closed state across
+  appends — a re-render must never re-collapse what the reader opened.
+- **The package deviates from the repo's CJS/tsc convention on purpose.**
+  It is the only ESM (`"type": "module"`), JSX, bundler-resolution package;
+  `build` is `tsc --noEmit && vite build`, still emitting `dist/**` so turbo
+  caching works unchanged. It imports no workspace packages — keep it that
+  way rather than teaching core/adapters about the session store.
