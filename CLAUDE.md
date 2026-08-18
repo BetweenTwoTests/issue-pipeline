@@ -110,3 +110,16 @@ comments; the reviewer role and mid-stack rework (M5); `stack_final_gate`;
 `pipe repo add`/`pipe init` (register a target repo by hand-editing
 `pipeline.yaml`, see `pipeline.example.yaml`). See DESIGN.md for what
 building each of these next would actually involve.
+
+## Code comments and tests
+
+Whenever you write or edit a code comment or a test, follow the
+`timeless-comments` skill
+([.claude/skills/timeless-comments/SKILL.md](.claude/skills/timeless-comments/SKILL.md)):
+comments describe the code as it stands — no issue/PR numbers (except
+`TODO(#123)`), no change-relative wording ("now", "previously", "used to
+be"); rejected alternatives are stated in the present ("X, not Y: Y
+would ..."). Tests must pass unchanged years from now: pin dates; the
+local Dockerized Temporal + offline `git`/`gt` the tests already use are
+fine, live external services are not. History worth keeping goes in
+DESIGN.md's bug list, which is deliberately a change record.

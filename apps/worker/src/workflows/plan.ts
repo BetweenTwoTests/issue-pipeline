@@ -127,8 +127,9 @@ export async function planWorkflow(input: PlanWorkflowInput): Promise<PlanWorkfl
 
   const rootIssue = await fetchRootIssue(repo, input.issueNumber);
 
-  // First line of idempotency defense against the (currently unbuilt)
-  // polling bridge re-finding this issue: flip the label immediately.
+  // First line of idempotency defense against anything that discovers work
+  // via the pipeline:ready label (e.g. a polling event bridge) re-finding
+  // this issue: flip the label immediately.
   await removeLabels(repo, input.issueNumber, ["pipeline:ready"]);
   await addLabels(repo, input.issueNumber, ["pipeline:in-progress"]);
 

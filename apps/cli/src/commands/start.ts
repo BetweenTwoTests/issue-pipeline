@@ -19,8 +19,8 @@ export function registerStartCommand(program: Command): void {
           workflowId,
           taskQueue: PIPELINE_TASK_QUEUE,
           // Governs the *closed*-workflow case. REJECT_DUPLICATE (rejects
-          // ANY prior execution, including failed ones) was the wrong
-          // choice here: it would permanently wedge an issue's workflow ID
+          // ANY prior execution, including failed ones) would be wrong
+          // here: it would permanently wedge an issue's workflow ID
           // after any failure, with no way to retry short of manually
           // terminating the old execution in Temporal. ALLOW_DUPLICATE_FAILED_ONLY
           // gives the actually-wanted semantics: block re-running an issue
