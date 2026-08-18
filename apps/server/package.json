@@ -1,0 +1,24 @@
+{
+  "name": "@issue-pipeline/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@issue-pipeline/core": "workspace:*",
+    "@issue-pipeline/store": "workspace:*",
+    "@temporalio/client": "1.22.0",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}

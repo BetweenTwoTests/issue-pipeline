@@ -1,6 +1,6 @@
 /**
- * Deep links into the local transcript viewer (apps/transcript-viewer) for a
- * Claude Code session. Pure string construction -- callers supply the
+ * Deep links into the local web app (apps/web) for a Claude Code session
+ * transcript. Pure string construction -- callers supply the
  * viewer's base URL (activities read it from PIPELINE_VIEWER_URL), which
  * keeps this importable from workflow code.
  */

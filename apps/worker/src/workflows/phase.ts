@@ -171,7 +171,7 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
       cwd: worktree.worktreePath,
       sessionId: agentSessionId(agentResult),
     });
-    await postWorklogComment(repo, input.subIssueNumber, worklog, transcriptFooter);
+    await postWorklogComment(repo, input.subIssueNumber, worklog, attempt === 0 ? "executor" : "fixer", transcriptFooter);
     const gateResult = await runLocalGates(worktree.worktreePath, config);
 
     await commitWorktreeChanges({

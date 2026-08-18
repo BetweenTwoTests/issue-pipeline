@@ -1,0 +1,25 @@
+{
+  "name": "@issue-pipeline/store",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "prisma generate && tsc",
+    "typecheck": "prisma generate && tsc --noEmit",
+    "lint": "eslint .",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "db:migrate": "prisma migrate deploy",
+    "db:migrate:dev": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@issue-pipeline/core": "workspace:*",
+    "@prisma/client": "^6.0.0"
+  },
+  "devDependencies": {
+    "dotenv": "^17.4.2",
+    "prisma": "^6.0.0",
+    "tsx": "^4.19.2"
+  }
+}

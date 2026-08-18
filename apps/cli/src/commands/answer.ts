@@ -6,7 +6,7 @@ export function registerAnswerCommand(program: Command): void {
   program
     .command("answer")
     .description("Answer one of a pipeline's numbered blocking questions")
-    .argument("<issue-ref>", 'GitHub issue URL or "owner/repo#123"')
+    .argument("<issue-ref>", '"owner/repo#123" (tracker issue number)')
     .argument("<index>", "1-based question number, as posted in the pipeline's comment")
     .argument("<text>", "Answer text (quote it if it contains spaces)")
     .action(async (issueRefArg: string, indexArg: string, text: string) => {

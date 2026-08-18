@@ -9,3 +9,9 @@ packages:
 onlyBuiltDependencies:
   - "@temporalio/core-bridge"
   - "esbuild"
+  # Prisma downloads its query/migration engines in postinstall scripts;
+  # blocked scripts mean `prisma generate`/`migrate` fail with a
+  # missing-engine error at runtime.
+  - "prisma"
+  - "@prisma/client"
+  - "@prisma/engines"

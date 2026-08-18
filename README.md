@@ -1,9 +1,12 @@
 # issue-pipeline
 
-Turns a GitHub issue containing a plan into a sequence of sub-issues, executes
+Turns an issue containing a plan into a sequence of sub-issues, executes
 each phase with an AI agent in an isolated git worktree, and opens a stacked
-PR per phase. Orchestrated by Temporal; GitHub issues/sub-issues are the
-source of truth; git branches are the workspace state.
+PR per phase. Orchestrated by Temporal. Issues, sub-issues, comments, and
+labels live in the pipeline's own Postgres (browse them in the web app,
+`just web`); git branches are the workspace state; GitHub is used for PRs
+and, optionally, as a one-way mirror of the tracker (`sync.provider` in
+`pipeline.yaml`).
 
 Currently implements: decompose a root issue into phases (with blocking/
 non-blocking open-question handling), and run each phase end-to-end
@@ -62,20 +65,36 @@ that repo is never touched.**
 ## Running it
 
 ```bash
-just infra-up   # Postgres + Temporal + Temporal UI (Docker, isolated ports: 5433/7833/8833)
-just worker     # starts the Temporal worker (foreground)
+just infra-up    # Postgres x2 + Temporal + Temporal UI (Docker, isolated ports: 5433/5434/7833/8833)
+just db-migrate  # apply the app database's migrations (issue tracker lives there)
+just worker      # starts the Temporal worker (foreground)
+just server      # backend API (issues, pipelines, transcripts) -- http://127.0.0.1:8846
+just web         # web app -- http://localhost:8845
 ```
 
-Or both together: `just up`. Temporal Web UI: http://localhost:8833
+Temporal Web UI: http://localhost:8833
 
-In another terminal, use the CLI via `just pipe <args>`:
+**Create an issue first** — the plan the pipeline decomposes is the body of
+a tracker issue in the app database, not a GitHub issue. Use the web app's
+"New issue" form (pick a registered repo, paste the plan as the body), or
+POST it:
 
 ```bash
-just pipe status                                    # connectivity check
-just pipe start https://github.com/my-org/my-repo/issues/123
-just pipe resume https://github.com/my-org/my-repo/issues/123
-just pipe skip   https://github.com/my-org/my-repo/issues/123
-just pipe abort  https://github.com/my-org/my-repo/issues/123
+curl -s -X POST http://127.0.0.1:8846/api/issues \
+  -H 'content-type: application/json' \
+  -d '{"repo": "my-org/my-repo", "title": "Add feature X", "body": "...the plan..."}'
+```
+
+Then start it — from the issue's page in the web app ("Start pipeline"), or
+with the CLI via `just pipe <args>` (`#12` is the tracker issue number the
+create step returned, not a GitHub number):
+
+```bash
+just pipe status                    # connectivity check
+just pipe start  my-org/my-repo#12
+just pipe resume my-org/my-repo#12
+just pipe skip   my-org/my-repo#12
+just pipe abort  my-org/my-repo#12
 ```
 
 `answer` and any `--note` take free-text that can contain spaces -- `just`'s
@@ -83,7 +102,7 @@ argument passthrough doesn't preserve quoting, so run those directly instead:
 
 ```bash
 pnpm --filter @issue-pipeline/cli build
-node apps/cli/dist/index.js answer https://github.com/my-org/my-repo/issues/123 1 "Use Postgres"
+node apps/cli/dist/index.js answer my-org/my-repo#12 1 "Use Postgres"
 ```
 
 `start` kicks off `PlanWorkflow` for that root issue: fetch → decompose into
@@ -92,18 +111,19 @@ branch on the previous phase's. A phase that fails after its fix attempts
 are exhausted parks the whole pipeline and posts a comment on the root issue
 explaining what happened; `resume`/`skip`/`abort` unblock it. `answer`
 answers one of the plan's numbered blocking questions (posted as a comment
-when decomposition can't proceed without a decision).
+when decomposition can't proceed without a decision). Answering and
+resume/skip/abort also work from the issue's pipeline page in the web app.
 
-Progress is visible in the Temporal UI (workflow history, and the executor's
-last output line via heartbeat) and as comments/labels on the GitHub issues
-themselves.
+Progress is visible in the web app (the issue page shows sub-issues,
+worklog comments, and labels as they land) and in the Temporal UI (workflow
+history, and the executor's last output line via heartbeat).
 
 ## Inspecting a run
 
-A finished (or parked) run leaves its trail in four places: Temporal history,
-the phase worktrees on disk, the Claude session transcripts, and the GitHub
-issues/PRs. There's no `pipe` subcommand for any of this — `pipe status` only
-checks namespace connectivity.
+A finished (or parked) run leaves its trail in four places: the tracker
+issues in the web app (`just web`), Temporal history, the phase worktrees on
+disk, and the GitHub PRs. There's no `pipe` subcommand for any of this —
+`pipe status` only checks namespace connectivity.
 
 Workflow IDs are derived, not random, so you can construct them:
 
@@ -171,7 +191,7 @@ ran in (a session resumed from anywhere else won't be found):
 cd ~/pipelines/my-repo/phases/123/p1 && claude --resume <session-id>
 ```
 
-### Worktrees and GitHub
+### Worktrees and the tracker
 
 Phase worktrees are left in place after a run: `~/pipelines/<repo-key>/phases/
 <root-issue>/p<N>`, where `<repo-key>` is the key under `repos:` in
@@ -180,9 +200,11 @@ a `WORKLOG.md.processed` — the phase's WORKLOG contract file, renamed once the
 workflow consumed it. `git log`, `git diff <parent-branch>`, and `gt log` all
 work there.
 
-On GitHub: each phase's WORKLOG is posted as a comment on that phase's
-sub-issue, and a parked pipeline labels the root issue `pipeline:stalled` and
-comments there with the failure reason.
+In the tracker (web app): each phase's WORKLOG is posted as a comment on
+that phase's sub-issue, and a parked pipeline labels the root issue
+`pipeline:stalled` and comments there with the failure reason. With
+`sync.provider: github` in `pipeline.yaml`, all of it is additionally
+mirrored one-way to GitHub issues.
 
 ## Adapters
 
@@ -201,9 +223,12 @@ pnpm --filter @issue-pipeline/worker test  # one package
 
 Package layout: `packages/core` (types/schemas/signals, no I/O — safe to
 import from Temporal workflow code), `packages/adapters` (claude.ts/codex.ts
-CLI wrappers + prompt templates), `packages/activities` (GitHub/git/gates,
-the actual I/O layer), `apps/worker` (the Temporal worker + `plan.ts`/
-`phase.ts` workflows), `apps/cli` (the `pipe` command).
+CLI wrappers + prompt templates), `packages/activities` (tracker/git/GitHub/
+gates, the actual I/O layer), `packages/store` (Prisma schema + repositories
+for the app database — the issue tracker), `apps/worker` (the Temporal
+worker + `plan.ts`/`phase.ts` workflows), `apps/cli` (the `pipe` command),
+`apps/server` + `apps/web` (the backend API and web app: issues, pipeline
+control, transcripts).
 
 ## Troubleshooting
 

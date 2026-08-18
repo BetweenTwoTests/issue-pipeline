@@ -21,6 +21,7 @@ function baseConfig(maxFixAttempts: number) {
     policy: { local_gates: "advisory" as const, max_fix_attempts: maxFixAttempts, auto_continue: true },
     branching: { stack_tool: "git" as const, branch_prefix: "pipe", remote: "origin", pr_draft: false },
     gates: { timeout_ms: 1000, commands: [] },
+    sync: { provider: "none" as const },
     repos: {},
   };
 }

@@ -1,0 +1,105 @@
+// The app database (APP_DATABASE_URL -> docker's ipl-app-postgres on port
+// 5434), deliberately a separate server from Temporal's postgres: app schema
+// migrations and data experiments must never touch workflow history.
+// Temporal remains the source of truth for execution state; this database
+// is the source of truth for tracker state -- issues, sub-issues, comments,
+// labels. External trackers (GitHub, Linear) only ever receive one-way
+// mirrors of these rows (see IssueMirror and
+// packages/core/src/contracts/tracker-sync.ts), never the other direction.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("APP_DATABASE_URL")
+}
+
+/// Audit record for pipeline runs triggered through the web UI. Answers
+/// "who started what, when, from where" even after Temporal's visibility
+/// retention has expired.
+model PipelineLaunch {
+  id          String   @id @default(cuid())
+  workflowId  String
+  owner       String
+  repo        String
+  issueNumber Int
+  source      String
+  triggeredBy String
+  createdAt   DateTime @default(now())
+
+  @@index([workflowId])
+  @@map("pipeline_launches")
+}
+
+/// A tracker issue: either a root plan issue (parentId null) or a phase
+/// sub-issue (parentId + phase + baseBranch set). `number` is a per-repo
+/// sequence allocated on insert, so refs read like GitHub's
+/// (owner/repo#123). Phase metadata is first-class columns rather than a
+/// machine-readable comment embedded in the body.
+model Issue {
+  id         String    @id @default(cuid())
+  repoOwner  String
+  repoName   String
+  number     Int
+  title      String
+  body       String
+  state      String    @default("open")
+  labels     String[]  @default([])
+  parentId   String?
+  parent     Issue?    @relation("IssueSubIssues", fields: [parentId], references: [id])
+  subIssues  Issue[]   @relation("IssueSubIssues")
+  /// 1-based phase index; null on root issues.
+  phase      Int?
+  /// The branch this phase stacks on; null on root issues.
+  baseBranch String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  closedAt   DateTime?
+
+  comments IssueComment[]
+  mirrors  IssueMirror[]
+
+  @@unique([repoOwner, repoName, number])
+  // Idempotency backstop for sub-issue creation under Temporal's
+  // at-least-once activity retries: one sub-issue per (parent, phase).
+  // Root issues (both columns null) never collide -- Postgres treats
+  // nulls as distinct in unique indexes.
+  @@unique([parentId, phase])
+  @@index([repoOwner, repoName, state])
+  @@map("issues")
+}
+
+model IssueComment {
+  id      String @id @default(cuid())
+  issueId String
+  issue   Issue  @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  /// Display name: the role ("pipeline", "planner", "executor", "fixer")
+  /// or a human username.
+  author     String
+  /// "pipeline" | "agent" | "human" -- see CommentAuthorKind in core.
+  authorKind String
+  body       String
+  createdAt  DateTime @default(now())
+
+  @@index([issueId, createdAt])
+  @@map("issue_comments")
+}
+
+/// Maps a tracker issue to its copy on an external tracker (one row per
+/// provider). Written by the sync layer when it first mirrors an issue;
+/// read back so later comment/label/close events target the same external
+/// issue.
+model IssueMirror {
+  id             String   @id @default(cuid())
+  issueId        String
+  issue          Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  provider       String
+  externalNumber Int
+  externalUrl    String
+  createdAt      DateTime @default(now())
+
+  @@unique([issueId, provider])
+  @@map("issue_mirrors")
+}

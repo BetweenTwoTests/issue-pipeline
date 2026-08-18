@@ -7,8 +7,10 @@ import { parseIssueRef, issueRefToWorkflowId } from "../lib/resolve";
 export function registerStartCommand(program: Command): void {
   program
     .command("start")
-    .description("Start a pipeline for a GitHub issue containing a plan")
-    .argument("<issue-ref>", 'GitHub issue URL or "owner/repo#123"')
+    .description(
+      "Start a pipeline for a tracker issue containing a plan (create the issue first: web UI \"New issue\" or POST /api/issues)",
+    )
+    .argument("<issue-ref>", '"owner/repo#123" (tracker issue number)')
     .action(async (issueRefArg: string) => {
       const ref = parseIssueRef(issueRefArg);
       const workflowId = issueRefToWorkflowId(ref);
