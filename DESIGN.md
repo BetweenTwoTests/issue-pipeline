@@ -9,11 +9,16 @@ and the roadmap.
 
 ## 1. What it does
 
-Turns a GitHub issue containing a plan into a sequence of sub-issues, runs
-each phase with an AI agent in an isolated git worktree, and opens a stacked
-PR per phase. GitHub issues/sub-issues are the source of truth for plan and
-progress; Temporal is the runtime; git branches are the workspace state. No
-database beyond Temporal's own Postgres persistence store.
+Turns an issue containing a plan into a sequence of sub-issues, runs each
+phase with an AI agent in an isolated git worktree, and opens a stacked PR
+per phase. The pipeline's own Postgres (`packages/store`, the "app
+database") is the source of truth for plan and progress -- issues,
+sub-issues, comments, labels -- browsed through the web app; Temporal is
+the runtime; git branches are the workspace state. GitHub's remaining
+roles: hosting the repos and PRs (real state -- code review happens
+there), and optionally receiving a one-way mirror of the tracker
+(`sync.provider: github`, §5). Nothing about plan/progress is ever read
+back from GitHub.
 
 ## 2. Scope: implemented vs. deferred
 
@@ -23,7 +28,7 @@ database beyond Temporal's own Postgres persistence store.
 | M1 — decompose (root issue → planner → sub-issues, blocking/non-blocking open questions) | Done |
 | M2 — single phase end-to-end (worktree → executor → WORKLOG.md → gates → PR) | Done |
 | M3 — sequential loop + stacking (parent loops children, Graphite/git stacking, fixer loop) | Built and live-tested. `stack_final_gate` (whole-stack CI gate before merge) is **not** built. |
-| M4 — event bridge (polling `pipeline:ready`, GitHub-comment `/approve /skip /abort /answer`) | **Not built.** Pipelines are started/un-parked via the `pipe` CLI only. |
+| M4 — event bridge (polling `pipeline:ready`) | **Not built.** Pipelines are started/un-parked via the `pipe` CLI and the web app. |
 | M5 — reviewer role, mid-stack rework, Codex-as-executor validation | **Not built** (reviewer role); Codex adapter exists and works but isn't the default (see §8). |
 
 Other things intentionally not built: the optional plan-approval gate (the
@@ -32,12 +37,30 @@ state machine — no functionality lost, just never exercised), `pipe repo
 add`/`pipe init` (repos are registered by hand-editing `pipeline.yaml`
 against `pipeline.example.yaml`).
 
+Caveat on "live-tested": M1–M3 were live-tested when tracker state was kept
+on GitHub issues. The tracker now lives in the app database (§5) behind the
+same activity contracts, and that swap — plus the optional GitHub mirror —
+has unit/integration coverage but no live multi-phase run yet.
+
 ## 3. Package architecture
 
 ```
 apps/worker  → packages/activities → packages/adapters → packages/core
-apps/cli     → packages/core (only — never activities)
+                                   → packages/store    → packages/core
+apps/cli     → packages/core (only — never activities or store)
+apps/server  → packages/core + packages/store (never activities/adapters)
 ```
+
+**Where the tracker lives.** `packages/store` owns the Prisma schema and
+repository functions for the app database. Both writers go through it: the
+worker's tracker activities (`packages/activities/src/tracker.ts`) and the
+web backend (`apps/server`). It stays free of Temporal, gh, git, and agent
+concerns — a pure repository layer returning the record shapes defined in
+`packages/core/src/contracts/tracker.ts`. The CLI deliberately does *not*
+get store access: issue creation is a web/API concern, and keeping the CLI
+a pure Temporal client preserves "every pipeline action flows through
+Temporal" (the one exception, issue CRUD, is data entry — not a pipeline
+action).
 
 **Why core must stay pure.** `packages/core` is imported for *values* by
 both workflow code (`apps/worker/src/workflows/*.ts`, which runs inside
@@ -184,31 +207,77 @@ captured `initialCommitSha`, would collapse the phase branch onto the
 parent's own commit — and the next amend would then rewrite the *parent's*
 history instead of the phase's own.
 
-## 5. GitHub mechanics (packages/activities/src/github.ts)
+## 5. Tracker persistence (packages/store) and the one-way sync seam
+
+**The tracker is Postgres, not GitHub.** The workflows' tracker operations
+(`fetchRootIssue`, `createSubIssue`, `postComment`, `postWorklogComment`,
+`addLabels`/`removeLabels`, `closeSubIssue` in
+`packages/activities/src/tracker.ts`) kept their names and
+`(RegisteredRepo, issueNumber)` signatures across the GitHub→Postgres move,
+so `plan.ts`/`phase.ts` are indifferent to where tracker state lives.
+Numbers are a per-repo sequence allocated by the store (refs still read
+`owner/repo#123`), and the plan workflow ID scheme
+(`pipeline-<owner>-<repo>-<n>`) is unchanged. Root issues are created by
+humans (web UI "New issue" / POST /api/issues) — `fetchRootIssue` throws
+`TrackerIssueNotFoundError` rather than ever creating one implicitly, and
+the server pre-checks existence on start so a bad ref fails the POST, not
+the workflow.
+
+- **Sub-issue idempotency is a DB constraint, not a list-scan.** The old
+  GitHub path re-listed sub-issues and matched an embedded
+  `<!-- pipeline: {...} -->` metadata comment to survive Temporal's
+  at-least-once retries; the store enforces one sub-issue per
+  `(parentId, phase)` with a unique index and returns the existing row on
+  a repeat create. Phase metadata (parent, phase, base branch) is
+  first-class columns, so sub-issue bodies stay clean markdown.
+- **Comment authorship is data.** Comments carry `author` +
+  `authorKind` (`pipeline` | `agent` | `human`). The executor prompt's
+  prior-phase handoff context selects `authorKind = "agent"` worklog
+  comments — a human comment pasted into a sub-issue can't leak into the
+  prompt by starting with the right heading.
+- **Control-plane comments live on the root issue, not the sub-issue.**
+  Sub-issues accumulate the execution log (worklog comments); the root
+  issue is where every "awaiting X" comment and state label goes, and where
+  a parked phase's explanation gets posted — one place for a human to look
+  for "what does this pipeline need from me."
+
+**The sync seam (one-way, Postgres → external).** Every tracker mutation,
+after its Postgres write commits, emits a `TrackerSyncEvent`
+(`issue_created` / `comment_added` / `labels_added` / `labels_removed` /
+`issue_closed`, defined in `packages/core/src/contracts/tracker-sync.ts`)
+through `mirrorTrackerEvent` in `packages/activities/src/tracker-sync.ts` —
+a choke point that resolves `sync.provider` from pipeline.yaml and **never
+throws**: mirroring is best-effort by contract, so an external-tracker
+outage can't park a phase. `provider: none` (default) makes it a no-op.
+`provider: github` (`tracker-sync-github.ts`) mirrors to GitHub issues on
+the issue's own repo slug, mapping tracker→GitHub issue numbers in the
+`issue_mirrors` table; issues are mirrored lazily on first event (enabling
+sync mid-pipeline picks up from there), sub-issues are linked via the
+GraphQL `addSubIssue` mutation and carry the `<!-- pipeline: {...} -->`
+metadata comment with the *GitHub-side* parent number. Adding Linear later
+= a new `TrackerSyncProvider` member + a `TrackerSyncPort` implementation +
+a `resolveTrackerSync` case; workflows and store don't change. Known
+limitation, on purpose: human comments written through the web UI are
+server-side writes and don't pass through the activities choke point, so
+they aren't mirrored — full-fidelity sync would be a store-level outbox
+table drained by a scheduled workflow (see §11).
+
+GitHub-mechanics facts that still govern the mirror path
+(`packages/activities/src/github.ts`):
 
 - **Sub-issues**: `gh` has no native sub-issue command (verified — checked
   `gh issue create --help`/`gh issue edit --help`, no `--parent` flag
   exists). Linking uses the GraphQL `addSubIssue` mutation with
   `subIssueUrl` (the child's plain URL, which `gh issue create` already
   prints — avoids a second lookup for the child's node ID) and
-  `replaceParent: true` (idempotent). Listing uses the REST endpoint
-  `GET /repos/{owner}/{repo}/issues/{n}/sub_issues`.
+  `replaceParent: true` (idempotent).
 - **Labels must exist on the repo before they can be added to *or removed
   from* an issue** — verified directly against a real repo:
   `gh issue edit --add-label`/`--remove-label` both fail with `'<label>'
-  not found` for a label that was never created. None of the `pipeline:*`
-  labels this system uses (`pipeline:in-progress`, `pipeline:needs-input`,
-  `pipeline:stalled`, `pipeline:done`) exist anywhere by default. Fix (in
-  `addLabels`/`removeLabels`): `addLabels` auto-creates any missing label
-  (`gh label create <name> --force`, idempotent) and retries once;
-  `removeLabels` treats "label doesn't exist" as an already-satisfied
-  no-op (removing a label that was never even defined on the repo can't
-  meaningfully fail).
-- **Control-plane comments live on the root issue, not the sub-issue.**
-  Sub-issues accumulate the execution log (worklog comments); the root
-  issue is where every "awaiting X" comment and state label goes, and where
-  a parked phase's explanation gets posted — one place for a human to look
-  for "what does this pipeline need from me."
+  not found` for a label that was never created. `addGithubIssueLabels`
+  auto-creates any missing label (`gh label create <name> --force`,
+  idempotent) and retries once; `removeGithubIssueLabels` treats "label
+  doesn't exist" as an already-satisfied no-op.
 
 ## 6. Git/Graphite mechanics (packages/activities/src/git.ts)
 
@@ -343,19 +412,29 @@ same container: `["CMD", "temporal", "operator", "cluster", "health",
 60-second polling `BridgePollWorkflow` (Temporal Schedules can only start
 *workflows*, never bare activities — confirmed against the SDK — so the
 bridge is necessarily a short-lived workflow, not a raw scheduled
-activity). It needs: an activity that lists `pipeline:ready` issues without
-a running pipeline workflow and `signalWithStart`s them (via a Client held
-inside that one activity — workflow code can't hold a `Client` directly,
-but `getExternalWorkflowHandle(workflowId)` from `@temporalio/workflow` can
-signal an already-running workflow with no Client at all); an activity that
-scans unprocessed comments on issues carrying a `pipeline:*` state label for
-`/approve /resume /skip /abort /answer N: text` and routes them to the
-right signal based on the issue's current label (`/approve` means different
-things depending on state — resolve that from the scanning activity, don't
-double-signal); and de-duplication via a bot-reaction marker on already-
-processed comments. None of `plan.ts`/`phase.ts` need to change — the
-signals and workflow-ID scheme already exist in `packages/core/src/
-signals.ts` for exactly this.
+activity). With the tracker in Postgres the bridge's job simplifies to one
+activity: list tracker issues labeled `pipeline:ready` that have no running
+pipeline workflow and `signalWithStart` them (via a Client held inside that
+one activity — workflow code can't hold a `Client` directly, but
+`getExternalWorkflowHandle(workflowId)` from `@temporalio/workflow` can
+signal an already-running workflow with no Client at all). The original
+GitHub-comment command half (`/approve /resume /skip /abort /answer` parsed
+out of issue comments) is superseded for the local tracker — the web UI
+delivers those as Temporal signals directly — and reviving it for mirrored
+GitHub issues would mean reading GitHub comments back, which the sync seam
+deliberately never does; if that's ever wanted, it's a separate inbound
+bridge with its own de-duplication (bot-reaction markers), not part of the
+sync provider.
+
+**Full-fidelity tracker sync.** The inline `mirrorTrackerEvent` choke point
+covers pipeline-originated writes only. If mirroring must also cover
+server-originated writes (human comments, future UI edits) and survive
+worker crashes between the Postgres write and the mirror call, move the
+seam down into `packages/store`: an outbox table appended in the same
+transaction as each mutation, drained in order by a scheduled workflow (the
+event bridge above is the natural host). The `TrackerSyncEvent` shape and
+`issue_mirrors` mapping table are already provider-shaped for exactly that
+upgrade.
 
 **`pipe repo add` / `pipe init`.** Needs a pure "given pipeline.yaml's raw
 text and a new repo entry, return the edited text" function in core (safe
@@ -382,63 +461,88 @@ whole system leans on (§5) — reviewer-rejects should probably feed the
 existing fixer loop (a new `FailureReason` variant) rather than becoming a
 third, separate retry mechanism.
 
-## 12. Transcript viewer (apps/transcript-viewer)
+## 12. Web app: transcripts + pipeline console (apps/web + apps/server)
 
-A standalone localhost web app for reading Claude Code session transcripts —
-interactive sessions and this pipeline's agent runs alike. It reads
-`~/.claude/projects/<cwd-derived-dir>/<sessionId>.jsonl` directly (Claude
-Code's internal store — undocumented, so the parser is deliberately
-defensive: unknown line/block types are skipped, malformed lines are counted
-and surfaced, never thrown on) and renders prompts, assistant text, thinking
-blocks, tool calls paired with their results by `tool_use_id`, and subagent
-sidechain groups. `just transcripts` → http://127.0.0.1:8845.
+Two packages, one localhost product. `apps/server` is the backend that
+powers the frontend and owns everything about how users interact with the
+pipeline; `apps/web` is a React/Vite frontend that proxies `/api` to it.
+`just server` + `just web` → http://127.0.0.1:8845 (frontend) over
+http://127.0.0.1:8846 (backend). Pipeline behavior that users may want to
+drive from the UI — starting runs, answering questions, and eventually
+editing prompts/policies — belongs in `apps/server`, not in the frontend
+and not in new CLI commands.
 
-The pipeline links back into it: worklog comments (executor/fixer, per
-attempt) and the root issue's phase-map comment (planner) end with an
+**apps/server** (CJS/tsc, the repo's standard package shape; workspace
+imports: core only, never activities/adapters):
+
+- **Transcripts**: reads `~/.claude/projects/<cwd-derived-dir>/<id>.jsonl`
+  directly (Claude Code's internal store — undocumented, so the parser is
+  deliberately defensive: unknown line/block types are skipped, malformed
+  lines counted and surfaced, never thrown on) and serves parsed events —
+  prompts, assistant text, thinking, tool calls paired with results by
+  `tool_use_id`, subagent sidechain groups. Live tail is byte-offset
+  polling: `/api/session?offset=<bytes>` returns only complete new lines (a
+  torn trailing write is held back until the next poll, unless it already
+  parses as complete JSON — a writer that just hasn't newline-terminated
+  yet). Event ids are `<entry uuid>:<block index>` so React reconciliation
+  preserves `<details>` open/closed state across appends — a re-render must
+  never re-collapse what the reader opened.
+- **Pipeline control**: lists `planWorkflow` executions, reads each one's
+  `planStatusQuery` (which exposes the blocking questions with answered
+  flags, the phase list, and the issue ref precisely so a UI can render an
+  answer form from workflow state alone), starts pipelines
+  (`signalWithStart` + kickoff, ALLOW_DUPLICATE_FAILED_ONLY — the same
+  semantics as `pipe start`, plus a pre-check that the tracker issue exists
+  and is a root issue, so a bad ref fails the POST rather than the
+  workflow), and delivers human responses as Temporal signals —
+  `questionsAnswered`, `resume`, `skip`, `abort` — through
+  `@temporalio/client` in `src/pipelines.ts`. Never shell out to `pipe` for
+  this: the workflow is the source of truth and the signal contracts live
+  in core. Status queries are raced against a 3s timeout because they hang
+  forever when no worker is running; unset TEMPORAL_ADDRESS/NAMESPACE →
+  503, never a default address, matching the worker/CLI rule.
+- **Issues**: `src/issues.ts` + the `/api/issues`, `/api/issue`,
+  `/api/issue/comment`, `/api/repos` routes serve and mutate the tracker
+  through `packages/store` — the issue list (with sub-issue progress
+  counts), a full issue page (body, labels, sub-issues, comments), issue
+  creation (validated against pipeline.yaml's registered repos, stored with
+  the yaml's casing so tracker keys always match what the worker looks up),
+  and human comments (`authorKind: "human"`). The frontend renders these as
+  a GitHub-style issue page; agent worklogs and pipeline notices arrive as
+  comments as phases run.
+- **Persistence**: the app database — docker's `ipl-app-postgres`
+  (postgres 18, port 5434), a separate server from Temporal's postgres so
+  app migrations can never touch workflow history. The schema and Prisma
+  client live in `packages/store` (shared with the worker's tracker
+  activities, which is why it's a package and not server-local). Temporal
+  stays the source of truth for execution state; the app DB is the source
+  of truth for tracker state (issues/comments/labels) and holds the
+  `pipeline_launches` audit rows (best-effort: a DB outage must never block
+  starting a pipeline). `APP_DATABASE_URL` in .env; `just db-migrate`
+  applies migrations.
+- **Security**: binds 127.0.0.1 only — it serves the whole session store
+  and can signal/start workflows. The `project`/`id` query params double as
+  path segments under the store root; strict shape validation
+  (directory-name charset, session UUID) is the path-traversal guard.
+  Mutating POSTs require same-origin `application/json` (cross-origin
+  callers hit a CORS preflight that fails, so a drive-by page cannot signal
+  workflows through a loopback server). The frontend proxy keeps
+  `changeOrigin: false` because this guard compares Origin against Host.
+
+**apps/web** is the repo's only ESM/JSX/bundler-resolution package (`build`
+is `tsc --noEmit && vite build`, still emitting `dist/**` so turbo caching
+works unchanged); its workspace deps (`server`, `core`) are type-only, so
+no backend code reaches the browser bundle. Don't copy its tsconfig for a
+backend package.
+
+The pipeline links back into the web app: worklog comments (executor/fixer,
+per attempt) and the root issue's phase-map comment (planner) end with an
 "Agent session transcript" footer deep-linking that run's session —
-`buildTranscriptFooter` in `packages/activities/src/agents.ts`, URL shape in
-`packages/core/src/transcript-link.ts` (which replicates Claude Code's
+`buildTranscriptFooter` in `packages/activities/src/agents.ts`, URL shape
+in `packages/core/src/transcript-link.ts` (which replicates Claude Code's
 cwd→directory flattening). `PIPELINE_VIEWER_URL` (default
-http://localhost:8845) feeds both the viewer's listen port and those links,
-so one variable moves both; the env read happens in the activity because
-workflow code cannot touch `process.env`.
-
-The viewer is also a human-in-the-loop surface (the "Pipelines" panel): it
-lists `planWorkflow` executions, reads each one's `planStatusQuery` (which
-exposes the blocking questions with answered flags, the phase list, and the
-issue ref precisely so a UI can render an answer form without GitHub
-access), and delivers responses as Temporal signals — `questionsAnswered`,
-`resume`, `skip`, `abort` — through `@temporalio/client` in
-`src/server/pipelines.ts`, exactly the CLI's mechanism. Never shell out to
-`pipe` for this: the workflow is the source of truth and the signal
-contracts live in core. Guards on the mutating POST endpoints: requests
-must be same-origin `application/json` (cross-origin callers hit a CORS
-preflight that fails, so a drive-by page cannot signal workflows through
-the loopback server), and status queries are raced against a 3s timeout
-because they hang forever when no worker is running. When
-TEMPORAL_ADDRESS/NAMESPACE are unset the panel returns 503 rather than
-defaulting to a bare address, matching the worker/CLI rule.
-
-Three decisions worth knowing before touching it:
-
-- **One process, loopback only.** The transcript API is Connect middleware
-  mounted inside Vite's own dev/preview server (`vite.config.ts`), so there
-  is no separate backend. The API serves the user's entire session store, so
-  the server must never listen on a routable interface (no `--host`). The
-  `project`/`id` query params double as path segments under the store root;
-  strict shape validation (directory-name charset, session UUID) is the
-  path-traversal guard.
-- **Live tail is byte-offset polling, and event ids must stay stable.** The
-  client polls `/api/session?offset=<bytes>` every 2s; the server returns
-  only complete new lines (a torn trailing write is held back until the next
-  poll, unless it already parses as complete JSON — a writer that just
-  hasn't newline-terminated yet). Event ids are `<entry uuid>:<block index>`
-  so React reconciliation preserves `<details>` open/closed state across
-  appends — a re-render must never re-collapse what the reader opened.
-- **The package deviates from the repo's CJS/tsc convention on purpose.**
-  It is the only ESM (`"type": "module"`), JSX, bundler-resolution package;
-  `build` is `tsc --noEmit && vite build`, still emitting `dist/**` so turbo
-  caching works unchanged. It imports no workspace packages — keep it that
-  way. Pipeline-side knowledge of the session store is capped at the pure
-  URL/dir-name shape in core's `transcript-link.ts`; all store I/O stays in
-  the viewer's own server code.
+http://localhost:8845) feeds both the frontend's port and those links, so
+one variable moves both; `PIPELINE_API_URL` (default http://localhost:8846)
+does the same for the backend and the frontend's proxy target. The env
+reads happen in activities/apps because workflow code cannot touch
+`process.env`.

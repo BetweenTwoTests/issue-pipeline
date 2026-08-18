@@ -31,9 +31,18 @@ worker:
 build:
     pnpm turbo run build
 
-# Web viewer for Claude Code session transcripts (http://127.0.0.1:8845)
-transcripts:
-    pnpm --filter @issue-pipeline/transcript-viewer dev
+# Backend API: transcripts + pipeline control + Prisma (http://127.0.0.1:8846)
+server:
+    pnpm --filter @issue-pipeline/server dev
+
+# Frontend web app; proxies /api to the backend (http://127.0.0.1:8845)
+web:
+    pnpm --filter @issue-pipeline/web dev
+
+# Apply the app database's Prisma migrations (schema in packages/store,
+# database ipl-app-postgres -- holds the issue tracker + launch audit)
+db-migrate:
+    pnpm --filter @issue-pipeline/store db:migrate
 
 # Run a one-off `pipe` CLI command, e.g. `just pipe status` or
 # `just pipe start https://github.com/owner/repo/issues/123`.

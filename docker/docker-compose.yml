@@ -18,6 +18,29 @@ services:
       timeout: 5s
       retries: 10
 
+  # The backend app's own database (Prisma), deliberately a separate server
+  # from Temporal's postgres above -- app schema changes and `infra-nuke`
+  # experiments on one must never touch the other's data.
+  app-postgres:
+    image: postgres:18-alpine
+    container_name: ipl-app-postgres
+    environment:
+      POSTGRES_USER: issue_pipeline
+      POSTGRES_PASSWORD: issue_pipeline
+      POSTGRES_DB: issue_pipeline
+    ports:
+      - "5434:5432"
+    volumes:
+      # postgres 18+ images keep data in a versioned subdirectory and expect
+      # the mount at /var/lib/postgresql (not the pre-18 .../data path, which
+      # the entrypoint rejects as an "unused mount").
+      - ipl-app-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U issue_pipeline"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   temporal:
     image: temporalio/auto-setup:1.29.7
     container_name: ipl-temporal
@@ -62,3 +85,5 @@ services:
 volumes:
   ipl-pgdata:
     name: ipl-pgdata
+  ipl-app-pgdata:
+    name: ipl-app-pgdata

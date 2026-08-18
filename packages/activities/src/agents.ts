@@ -21,7 +21,7 @@ import {
   type FixerPromptInput,
 } from "@issue-pipeline/adapters";
 import type { RegisteredRepo } from "@issue-pipeline/core";
-import { listComments } from "./github";
+import { listComments } from "@issue-pipeline/store";
 
 /**
  * Workflow code must never import @issue-pipeline/adapters directly -- doing
@@ -60,9 +60,16 @@ export async function buildExecutorPrompt(input: BuildExecutorPromptInput): Prom
   if (input.priorSubIssueNumbers.length > 0) {
     const chunks: string[] = [];
     for (const subIssueNumber of input.priorSubIssueNumbers) {
-      const comments = await listComments(input.repo, subIssueNumber);
+      const comments = await listComments({
+        repoOwner: input.repo.owner,
+        repoName: input.repo.repo,
+        number: subIssueNumber,
+      });
       for (const comment of comments) {
-        if (comment.body.startsWith("## Worklog")) {
+        // Only agent-authored worklogs count as handoff context -- a human
+        // comment that happens to open with "## Worklog" must not be
+        // mistaken for a phase's self-report.
+        if (comment.authorKind === "agent" && comment.body.startsWith("## Worklog")) {
           chunks.push(`### Phase sub-issue #${subIssueNumber}\n${comment.body}`);
         }
       }
@@ -99,23 +106,22 @@ const DEFAULT_PERMISSION_MODE: Record<AgentRole, string> = {
   fixer: "bypassPermissions",
 };
 
-/** The transcript viewer's own default port (apps/transcript-viewer). */
+/** The web app's own default port (apps/web). */
 const DEFAULT_VIEWER_URL = "http://localhost:8845";
 
 /**
  * Markdown footer linking an agent run's session transcript in the local
- * viewer (`just transcripts`). Empty when the run reported no session id
- * (codex has no session concept; a crashed claude run may report none) --
- * callers append the result verbatim. The base URL comes from
- * PIPELINE_VIEWER_URL so links track wherever the viewer listens; they
- * resolve only on the operator's machine, matching the viewer's
- * loopback-only design.
+ * web app (`just web`). Empty when the run reported no session id (codex
+ * has no session concept; a crashed claude run may report none) -- callers
+ * append the result verbatim. The base URL comes from PIPELINE_VIEWER_URL
+ * so links track wherever the web app listens; they resolve only on the
+ * operator's machine, matching its loopback-only design.
  */
 export async function buildTranscriptFooter(input: { cwd: string; sessionId?: string }): Promise<string> {
   if (!input.sessionId) return "";
   const configured = process.env.PIPELINE_VIEWER_URL?.trim();
   const url = buildTranscriptUrl(configured || DEFAULT_VIEWER_URL, input.cwd, input.sessionId);
-  return `\n\n---\n[Agent session transcript](${url}) (local viewer: \`just transcripts\`)`;
+  return `\n\n---\n[Agent session transcript](${url}) (local web app: \`just web\`)`;
 }
 
 export async function runAgent(input: RunAgentInput): Promise<AgentResult> {

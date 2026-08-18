@@ -2,10 +2,16 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "transcript-viewer",
+      "name": "web",
       "runtimeExecutable": "pnpm",
-      "runtimeArgs": ["--filter", "@issue-pipeline/transcript-viewer", "dev"],
+      "runtimeArgs": ["--filter", "@issue-pipeline/web", "dev"],
       "port": 8845
+    },
+    {
+      "name": "server",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@issue-pipeline/server", "dev"],
+      "port": 8846
     }
   ]
 }

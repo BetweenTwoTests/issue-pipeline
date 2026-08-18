@@ -8,6 +8,7 @@ export { PIPELINE_TASK_QUEUE } from "./task-queue";
 // purpose) for the actual loader.
 
 export { PLAN_WORKFLOW_NAME, planWorkflowId } from "./workflow-names";
+export { parseIssueRef, issueRefToWorkflowId, type IssueRef } from "./issue-ref";
 
 export {
   kickoffSignal,
@@ -28,6 +29,17 @@ export {
   type PlanPhaseStatus,
 } from "./signals";
 
+export {
+  issueKey,
+  formatIssueRef,
+  type IssueState,
+  type CommentAuthorKind,
+  type IssueKey,
+  type TrackerIssue,
+  type TrackerComment,
+} from "./contracts/tracker";
+export type { TrackerSyncProvider, TrackerSyncEvent, TrackerSyncPort } from "./contracts/tracker-sync";
+
 export { agentSessionId, type AgentRole, type AdapterName, type AgentResult } from "./contracts/agent";
 export { claudeProjectDirName, buildTranscriptUrl } from "./transcript-link";
 export type { WorklogStatus, WorklogSections } from "./contracts/worklog";
@@ -36,6 +48,7 @@ export {
   RoleNotConfiguredError,
   WorklogContractViolationError,
   PlannerOutputParseError,
+  TrackerIssueNotFoundError,
   GitOperationError,
   GithubCliError,
 } from "./contracts/errors";

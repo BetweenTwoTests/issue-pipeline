@@ -6,7 +6,7 @@ export function registerSkipCommand(program: Command): void {
   program
     .command("skip")
     .description("Skip the currently parked phase and move on to the next one")
-    .argument("<issue-ref>", 'GitHub issue URL or "owner/repo#123"')
+    .argument("<issue-ref>", '"owner/repo#123" (tracker issue number)')
     .option("--note <text>", "Optional note to record with the skip")
     .action(async (issueRefArg: string, opts: { note?: string }) => {
       await withPipelineHandle(issueRefArg, async (handle, workflowId) => {

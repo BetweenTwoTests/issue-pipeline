@@ -55,6 +55,16 @@ export const PipelineConfigSchema = z
       })
       .strict()
       .default({}),
+    // One-way mirroring of tracker writes (app database -> external
+    // tracker). "none" disables it; "github" mirrors issues/comments/labels
+    // to each repo's `github:` slug. See TrackerSyncPort in
+    // contracts/tracker-sync.ts for what adding a provider involves.
+    sync: z
+      .object({
+        provider: z.enum(["none", "github"]).default("none"),
+      })
+      .strict()
+      .default({}),
     repos: z
       .record(
         z.string(),

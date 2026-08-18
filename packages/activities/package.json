@@ -14,6 +14,7 @@
   "dependencies": {
     "@issue-pipeline/adapters": "workspace:*",
     "@issue-pipeline/core": "workspace:*",
+    "@issue-pipeline/store": "workspace:*",
     "@temporalio/activity": "1.22.0",
     "yaml": "^2.7.0"
   },

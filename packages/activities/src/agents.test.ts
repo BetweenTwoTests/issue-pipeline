@@ -131,7 +131,7 @@ test("buildTranscriptFooter links the session in the viewer, honoring PIPELINE_V
         "http://localhost:8845/#p=-Users-alice-pipelines-demo-phases-3-p1&s=aaaaaaaa-0000-0000-0000-000000000001",
       ),
     );
-    assert.ok(footer.includes("just transcripts"));
+    assert.ok(footer.includes("just web"));
 
     process.env.PIPELINE_VIEWER_URL = "http://localhost:9911/";
     const custom = await buildTranscriptFooter({ cwd: "/tmp/wt", sessionId: "s-1" });

@@ -1,7 +1,7 @@
 import { defineSignal, defineQuery } from "@temporalio/workflow";
 
 export interface KickoffPayload {
-  source: "cli";
+  source: "cli" | "web";
   triggeredBy: string;
 }
 

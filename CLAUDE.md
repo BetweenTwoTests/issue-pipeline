@@ -4,13 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Temporal-orchestrated pipeline that decomposes a GitHub issue containing a
-plan into sequential phases, executes each with an AI agent in an isolated
-git worktree, and opens a stacked PR per phase. See [DESIGN.md](DESIGN.md)
-for the full architecture, every non-obvious decision and why, a running
-list of real bugs already found and fixed (read this before "fixing" the
-same thing again), and what's deliberately not built yet. This file is
-just commands + the constraints that will bite you fastest.
+A Temporal-orchestrated pipeline that decomposes an issue containing a plan
+into sequential phases, executes each with an AI agent in an isolated git
+worktree, and opens a stacked PR per phase. Issues/sub-issues/comments/
+labels live in the pipeline's own Postgres (`packages/store`, browsed via
+`apps/web`); GitHub is used for PRs and, optionally, as a one-way mirror of
+the tracker (`sync.provider`). See [DESIGN.md](DESIGN.md) for the full
+architecture, every non-obvious decision and why, a running list of real
+bugs already found and fixed (read this before "fixing" the same thing
+again), and what's deliberately not built yet. This file is just commands +
+the constraints that will bite you fastest.
 
 ## Commands
 
@@ -36,9 +39,10 @@ just infra-up   # Postgres + Temporal + Temporal UI (Docker, isolated ports 5433
 just worker     # Temporal worker (tsx watch — restart it manually after changing packages/activities
                 # or packages/adapters; watch mode doesn't reliably pick up dependency dist/ rebuilds)
 just pipe <args>  # the `pipe` CLI (builds apps/cli first, then runs it) -- e.g. `just pipe status`
-just transcripts  # web viewer for Claude session transcripts (~/.claude/projects);
-                  # PIPELINE_VIEWER_URL sets its port AND the transcript links in
-                  # issue comments (default http://localhost:8845)
+just server       # backend API: transcripts + pipeline control + Prisma (http://127.0.0.1:8846)
+just web          # frontend, proxies /api to the backend; PIPELINE_VIEWER_URL sets its
+                  # port AND the transcript links in issue comments (default :8845)
+just db-migrate   # apply Prisma migrations to the app DB (ipl-app-postgres, port 5434)
 ```
 `just pipe`'s argument passthrough does not preserve quoting for multi-word
 text (`answer`'s `<text>`, any `--note`) — for those, run
@@ -47,16 +51,24 @@ text (`answer`'s `<text>`, any `--note`) — for those, run
 
 ## Architecture
 
-Turborepo monorepo, five packages with a strict one-way dependency graph:
-`apps/worker` → `packages/activities` → `packages/adapters` → `packages/core`;
-`apps/cli` → `packages/core` only (the CLI talks to Temporal purely via
-`@temporalio/client` — it never imports activities). A sixth workspace
-package, `apps/transcript-viewer`, follows the CLI's rule — a React/Vite
-web viewer for Claude Code session transcripts whose only workspace import
-is `packages/core` (signal/query contracts; it talks to Temporal via
-`@temporalio/client` for its human-in-the-loop pipelines panel, and never
-imports activities/adapters). See DESIGN.md §12; it is also the repo's only
-ESM/JSX package, so don't copy its tsconfig for a new backend package.
+Turborepo monorepo with a strict one-way dependency graph:
+`apps/worker` → `packages/activities` → `packages/adapters` → `packages/core`,
+with `packages/activities` → `packages/store` → `packages/core` for the
+tracker; `apps/cli` → `packages/core` only (the CLI talks to Temporal purely
+via `@temporalio/client` — it never imports activities or store; issues are
+created via the web app/API, not the CLI). `packages/store` owns the Prisma
+schema and repositories for the app database (docker's `ipl-app-postgres` on
+5434 — never Temporal's postgres): the issue tracker (issues, sub-issues,
+comments, labels — the state the pipeline used to keep on GitHub) plus the
+launch audit. `apps/server` is the backend that powers the frontend and owns
+everything about how users interact with the pipeline — Claude session
+transcripts read from `~/.claude/projects`, pipeline list/query/signal/START
+via `@temporalio/client`, and issue CRUD via `packages/store`. Its workspace
+imports are `packages/core` + `packages/store`; it never imports
+activities/adapters. `apps/web` (React/Vite frontend) proxies `/api` to the
+server and imports workspace packages type-only. See DESIGN.md §12.
+`apps/web` is the repo's only ESM/JSX package — don't copy its tsconfig for
+a backend package.
 
 **The determinism constraint that matters more than the dependency graph
 diagram suggests:** `apps/worker/src/workflows/*.ts` (`plan.ts`, `phase.ts`)
@@ -78,13 +90,18 @@ run inside Temporal's workflow sandbox. Temporal's worker bundles everything
   rather than shared through core, for exactly this reason).
 
 Within `packages/activities`, activities are grouped by concern:
-`github.ts` (gh CLI + GraphQL), `git.ts` (bare clone / worktree / Graphite
-stacking), `agents.ts` (the `runAgent` dispatcher + the WORKLOG.md and
-planner-JSON contract parsers), `gates.ts` (advisory test/lint/build
-commands), `config.ts` (pipeline.yaml loading + repo resolution).
-`packages/adapters` is the CLI-shelling layer underneath `agents.ts`
-(`claude.ts`, `codex.ts`, prompt templates) — activities never shell out
-directly, they go through an adapter.
+`tracker.ts` (issue/sub-issue/comment/label operations against the app
+database — every mutation also emits a best-effort one-way sync event),
+`tracker-sync.ts` + `tracker-sync-github.ts` (the sync seam: provider
+resolution, the never-throws choke point, and the GitHub mirror),
+`github.ts` (gh CLI: PRs, plus the raw issue helpers the GitHub mirror
+uses), `git.ts` (bare clone / worktree / Graphite stacking), `agents.ts`
+(the `runAgent` dispatcher + the WORKLOG.md and planner-JSON contract
+parsers), `gates.ts` (advisory test/lint/build commands), `config.ts`
+(pipeline.yaml loading + repo resolution). `packages/adapters` is the
+CLI-shelling layer underneath `agents.ts` (`claude.ts`, `codex.ts`, prompt
+templates) — agent runs never shell out directly from activities, they go
+through an adapter.
 
 **Two workflows, one recursion-shaped relationship:** `planWorkflow` fetches
 the root issue, runs the planner, handles blocking/non-blocking open
@@ -113,12 +130,15 @@ than special-casing it.
 
 Implemented and live-tested against a real repo: decompose (M1), single- and
 multi-phase sequential execution with Graphite/git stacking (M2 + most of
-M3). **Not built**: the polling event bridge / GitHub-comment commands
-(M4) — pipelines are driven by the `pipe` CLI only, not `/approve`-style
-comments; the reviewer role and mid-stack rework (M5); `stack_final_gate`;
-`pipe repo add`/`pipe init` (register a target repo by hand-editing
-`pipeline.yaml`, see `pipeline.example.yaml`). See DESIGN.md for what
-building each of these next would actually involve.
+M3) — live-tested when the tracker was GitHub-backed; the Postgres tracker
+(`packages/store`) carries the same activity contracts but has not yet run
+a live multi-phase pipeline. **Not built**: the polling event bridge (M4) —
+pipelines are driven by the `pipe` CLI and the web app; the reviewer role
+and mid-stack rework (M5); `stack_final_gate`; `pipe repo add`/`pipe init`
+(register a target repo by hand-editing `pipeline.yaml`, see
+`pipeline.example.yaml`). The GitHub tracker mirror (`sync.provider:
+github`) is wired but not live-tested. See DESIGN.md for what building each
+of these next would actually involve.
 
 ## Code comments and tests
 

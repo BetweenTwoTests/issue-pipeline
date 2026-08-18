@@ -41,6 +41,14 @@ gates:
     - { name: test, command: pnpm, args: ["turbo", "run", "test"] }
     - { name: lint, command: pnpm, args: ["turbo", "run", "lint"] }
 
+# One-way mirroring of tracker state (issues/sub-issues/comments/labels live
+# in the app database) to an external tracker. "none" (default) keeps
+# everything local; "github" mirrors each write to GitHub issues on the
+# repo's `github:` slug below -- best-effort, never read back, and a GitHub
+# outage never affects the pipeline.
+sync:
+  provider: none
+
 repos:
   chronic-backend:
     github: Flagler-Health/chronic-backend
