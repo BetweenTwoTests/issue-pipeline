@@ -1,4 +1,19 @@
+import type { PlanStatus } from "@issue-pipeline/core";
+
 /** Types shared between the server middleware and the React client. */
+
+/** One plan workflow as shown in the pipelines panel. */
+export interface PipelineListItem {
+  workflowId: string;
+  runId: string;
+  /** Temporal execution status: RUNNING, COMPLETED, TERMINATED, FAILED, ... */
+  executionStatus: string;
+  startTime: string | null;
+  /** Result of the workflow's status query, when it answered in time. */
+  plan?: PlanStatus;
+  /** Why `plan` is missing (query timeout usually means no worker running). */
+  queryError?: string;
+}
 
 export type EventKind = "prompt" | "assistant_text" | "thinking" | "tool_use" | "tool_result";
 

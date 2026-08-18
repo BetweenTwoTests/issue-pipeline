@@ -51,10 +51,12 @@ Turborepo monorepo, five packages with a strict one-way dependency graph:
 `apps/worker` → `packages/activities` → `packages/adapters` → `packages/core`;
 `apps/cli` → `packages/core` only (the CLI talks to Temporal purely via
 `@temporalio/client` — it never imports activities). A sixth workspace
-package, `apps/transcript-viewer`, sits outside the graph entirely — a
-React/Vite web viewer for Claude Code session transcripts that imports no
-workspace packages (see DESIGN.md §12; it is also the repo's only ESM/JSX
-package, so don't copy its tsconfig for a new backend package).
+package, `apps/transcript-viewer`, follows the CLI's rule — a React/Vite
+web viewer for Claude Code session transcripts whose only workspace import
+is `packages/core` (signal/query contracts; it talks to Temporal via
+`@temporalio/client` for its human-in-the-loop pipelines panel, and never
+imports activities/adapters). See DESIGN.md §12; it is also the repo's only
+ESM/JSX package, so don't copy its tsconfig for a new backend package.
 
 **The determinism constraint that matters more than the dependency graph
 diagram suggests:** `apps/worker/src/workflows/*.ts` (`plan.ts`, `phase.ts`)

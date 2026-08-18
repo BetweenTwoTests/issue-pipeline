@@ -48,6 +48,15 @@ importers:
 
   apps/transcript-viewer:
     dependencies:
+      '@issue-pipeline/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@temporalio/client':
+        specifier: 1.22.0
+        version: 1.22.0
+      dotenv:
+        specifier: ^17.4.2
+        version: 17.4.2
       react:
         specifier: ^19.1.0
         version: 19.2.8

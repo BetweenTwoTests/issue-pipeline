@@ -85,6 +85,9 @@ interface PlanState {
   phases: PhaseRecord[];
   currentIndex: number;
   answers: AnswersPayload["answers"];
+  /** The planner's blocking questions, kept so the status query can show
+   * them (with answered flags) to human-in-the-loop surfaces. */
+  blockingQuestions: OpenQuestion[];
   decision?: "resume" | "skip" | "abort";
   aborted: boolean;
 }
@@ -95,6 +98,7 @@ export async function planWorkflow(input: PlanWorkflowInput): Promise<PlanWorkfl
     phases: [],
     currentIndex: 0,
     answers: [],
+    blockingQuestions: [],
     aborted: false,
   };
 
@@ -117,9 +121,24 @@ export async function planWorkflow(input: PlanWorkflowInput): Promise<PlanWorkfl
   });
   setHandler(planStatusQuery, (): PlanStatus => ({
     status: state.status,
+    owner: input.owner,
+    repo: input.repo,
+    issueNumber: input.issueNumber,
     currentIndex: state.currentIndex,
     totalPhases: state.phases.length,
     headBranch: state.phases[state.currentIndex]?.headBranch ?? null,
+    blockingQuestions: state.blockingQuestions.map((q, i) => ({
+      index: i + 1,
+      question: q.q,
+      proposedAnswer: q.proposed_answer,
+      answered: state.answers.some((a) => a.index === i + 1),
+    })),
+    phases: state.phases.map((p) => ({
+      subIssueNumber: p.subIssueNumber,
+      title: p.title,
+      status: p.status,
+      headBranch: p.headBranch,
+    })),
   }));
 
   const config = await loadPipelineConfig();
@@ -152,6 +171,7 @@ export async function planWorkflow(input: PlanWorkflowInput): Promise<PlanWorkfl
 
   const blockingQuestions = decomposition.open_questions.filter((q) => q.blocking);
   const nonBlockingQuestions = decomposition.open_questions.filter((q) => !q.blocking);
+  state.blockingQuestions = blockingQuestions;
 
   if (nonBlockingQuestions.length > 0) {
     await postComment(repo, input.issueNumber, formatAssumptions(nonBlockingQuestions));
