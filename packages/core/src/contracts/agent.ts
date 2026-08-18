@@ -17,3 +17,13 @@ export interface AgentResult {
   raw?: string;
   meta?: Record<string, unknown>;
 }
+
+/**
+ * The Claude session id the claude adapter records in meta.sessionId --
+ * undefined for adapters with no session concept (codex) and for crashed
+ * runs that produced no parseable CLI output.
+ */
+export function agentSessionId(result: AgentResult): string | undefined {
+  const value = result.meta?.sessionId;
+  return typeof value === "string" && value !== "" ? value : undefined;
+}

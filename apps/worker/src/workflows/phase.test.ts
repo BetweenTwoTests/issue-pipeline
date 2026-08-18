@@ -79,6 +79,7 @@ test("phaseWorkflow: retries exactly max_fix_attempts times then parks when the 
         throw new Error("should not be reached: runAgent always fails before worklog parsing");
       },
       postWorklogComment: async () => {},
+      buildTranscriptFooter: async () => "",
       runLocalGates: async () => ({ passed: true, results: [] }),
       commitWorktreeChanges: async () => ({ committed: false }),
       submitPullRequest: async () => {
@@ -151,6 +152,7 @@ test("phaseWorkflow: closes the sub-issue and returns done when the worklog says
         raw: "## Done\ndid the thing\n\n## Status: done",
       }),
       postWorklogComment: async () => {},
+      buildTranscriptFooter: async () => "",
       runLocalGates: async () => ({ passed: true, results: [] }),
       commitWorktreeChanges: async () => ({ committed: true }),
       submitPullRequest: async () => {

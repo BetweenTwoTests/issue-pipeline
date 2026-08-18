@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { PlannerOutputParseError, WorklogContractViolationError } from "@issue-pipeline/core";
-import { parsePlannerOutput, readAndClearWorklog } from "./agents";
+import { buildTranscriptFooter, parsePlannerOutput, readAndClearWorklog } from "./agents";
 
 const VALID_PLANNER_JSON = JSON.stringify({
   phases: [
@@ -116,4 +116,32 @@ test("readAndClearWorklog is idempotent: a retry after the file was already rena
     const second = await readAndClearWorklog(dir);
     assert.deepEqual(second, first);
   });
+});
+
+test("buildTranscriptFooter links the session in the viewer, honoring PIPELINE_VIEWER_URL", async () => {
+  const saved = process.env.PIPELINE_VIEWER_URL;
+  try {
+    delete process.env.PIPELINE_VIEWER_URL;
+    const footer = await buildTranscriptFooter({
+      cwd: "/Users/alice/pipelines/demo/phases/3/p1",
+      sessionId: "aaaaaaaa-0000-0000-0000-000000000001",
+    });
+    assert.ok(
+      footer.includes(
+        "http://localhost:8845/#p=-Users-alice-pipelines-demo-phases-3-p1&s=aaaaaaaa-0000-0000-0000-000000000001",
+      ),
+    );
+    assert.ok(footer.includes("just transcripts"));
+
+    process.env.PIPELINE_VIEWER_URL = "http://localhost:9911/";
+    const custom = await buildTranscriptFooter({ cwd: "/tmp/wt", sessionId: "s-1" });
+    assert.ok(custom.includes("http://localhost:9911/#p=-tmp-wt&s=s-1"));
+  } finally {
+    if (saved === undefined) delete process.env.PIPELINE_VIEWER_URL;
+    else process.env.PIPELINE_VIEWER_URL = saved;
+  }
+});
+
+test("buildTranscriptFooter is empty when the run reported no session id", async () => {
+  assert.equal(await buildTranscriptFooter({ cwd: "/tmp/wt" }), "");
 });

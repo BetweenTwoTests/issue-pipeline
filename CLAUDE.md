@@ -36,7 +36,9 @@ just infra-up   # Postgres + Temporal + Temporal UI (Docker, isolated ports 5433
 just worker     # Temporal worker (tsx watch — restart it manually after changing packages/activities
                 # or packages/adapters; watch mode doesn't reliably pick up dependency dist/ rebuilds)
 just pipe <args>  # the `pipe` CLI (builds apps/cli first, then runs it) -- e.g. `just pipe status`
-just transcripts  # web viewer for Claude session transcripts (~/.claude/projects) on http://127.0.0.1:8845
+just transcripts  # web viewer for Claude session transcripts (~/.claude/projects);
+                  # PIPELINE_VIEWER_URL sets its port AND the transcript links in
+                  # issue comments (default http://localhost:8845)
 ```
 `just pipe`'s argument passthrough does not preserve quoting for multi-word
 text (`answer`'s `<text>`, any `--note`) — for those, run

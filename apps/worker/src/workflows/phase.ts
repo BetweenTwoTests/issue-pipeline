@@ -1,13 +1,22 @@
 import { proxyActivities } from "@temporalio/workflow";
 import type * as activities from "@issue-pipeline/activities";
-import { buildPhaseBranchName, type RegisteredRepo, type PipelineConfig } from "@issue-pipeline/core";
+import { agentSessionId, buildPhaseBranchName, type RegisteredRepo, type PipelineConfig } from "@issue-pipeline/core";
 
 const quick = proxyActivities<typeof activities>({
   startToCloseTimeout: "30s",
   retry: { maximumAttempts: 3 },
 });
-const { loadPipelineConfig, resolveRegisteredRepoBySlug, ensureBareClone, fetchRepo, postComment, addLabels, closeSubIssue, setPullRequestBody } =
-  quick;
+const {
+  loadPipelineConfig,
+  resolveRegisteredRepoBySlug,
+  ensureBareClone,
+  fetchRepo,
+  postComment,
+  addLabels,
+  closeSubIssue,
+  setPullRequestBody,
+  buildTranscriptFooter,
+} = quick;
 
 // Worktree/git operations -- can be slow on a cold cache; safe to retry, every
 // one of them is designed idempotent (see git.ts).
@@ -158,7 +167,11 @@ export async function phaseWorkflow(input: PhaseWorkflowInput): Promise<PhaseWor
       continue;
     }
 
-    await postWorklogComment(repo, input.subIssueNumber, worklog);
+    const transcriptFooter = await buildTranscriptFooter({
+      cwd: worktree.worktreePath,
+      sessionId: agentSessionId(agentResult),
+    });
+    await postWorklogComment(repo, input.subIssueNumber, worklog, transcriptFooter);
     const gateResult = await runLocalGates(worktree.worktreePath, config);
 
     await commitWorktreeChanges({

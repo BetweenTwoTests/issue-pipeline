@@ -8,6 +8,7 @@ import {
   abortSignal,
   planStatusQuery,
   slugify,
+  agentSessionId,
   buildPhaseBranchName,
   type KickoffPayload,
   type AnswersPayload,
@@ -36,6 +37,7 @@ const {
   addLabels,
   removeLabels,
   closeSubIssue,
+  buildTranscriptFooter,
 } = quick;
 
 const promptBuilding = proxyActivities<typeof activities>({
@@ -143,6 +145,9 @@ export async function planWorkflow(input: PlanWorkflowInput): Promise<PlanWorkfl
 
   const firstPrompt = await buildPlannerPrompt(plannerPromptInput);
   const firstAgentResult = await runAgent({ role: "planner", prompt: firstPrompt, cwd: repo.localPath, config });
+  // The run whose transcript the phase-map comment links to -- the re-plan
+  // below supersedes the first run when blocking questions were answered.
+  let plannerAgentResult = firstAgentResult;
   let decomposition = await parsePlannerOutput(firstAgentResult.summary);
 
   const blockingQuestions = decomposition.open_questions.filter((q) => q.blocking);
@@ -189,6 +194,7 @@ export async function planWorkflow(input: PlanWorkflowInput): Promise<PlanWorkfl
       rootIssueBody: `${plannerPromptInput.rootIssueBody}\n\n## Answers to previously-blocking questions\n${answersText}`,
     });
     const secondAgentResult = await runAgent({ role: "planner", prompt: secondPrompt, cwd: repo.localPath, config });
+    plannerAgentResult = secondAgentResult;
     decomposition = await parsePlannerOutput(secondAgentResult.summary);
   }
 
@@ -203,7 +209,11 @@ export async function planWorkflow(input: PlanWorkflowInput): Promise<PlanWorkfl
     status: "pending" as const,
   }));
 
-  await postComment(repo, input.issueNumber, formatPhaseMap(state.phases));
+  const plannerTranscriptFooter = await buildTranscriptFooter({
+    cwd: repo.localPath,
+    sessionId: agentSessionId(plannerAgentResult),
+  });
+  await postComment(repo, input.issueNumber, formatPhaseMap(state.phases) + plannerTranscriptFooter);
 
   let baseBranch = repo.defaultBranch;
   const priorSubIssueNumbers: number[] = [];

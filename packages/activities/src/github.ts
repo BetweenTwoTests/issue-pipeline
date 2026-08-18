@@ -196,6 +196,9 @@ export async function postWorklogComment(
   repo: RegisteredRepo,
   issueNumber: number,
   worklog: WorklogSections,
+  /** Appended verbatim after the template (e.g. the transcript-viewer footer
+   * from buildTranscriptFooter); "" adds nothing. */
+  footer = "",
 ): Promise<{ url: string }> {
   const body = `## Worklog (status: ${worklog.status})
 
@@ -209,7 +212,7 @@ ${worklog.deviationsFromSpec}
 ${worklog.surprisesFindings}
 
 ### Follow-ups
-${worklog.followUps}`;
+${worklog.followUps}${footer}`;
   return postComment(repo, issueNumber, body);
 }
 

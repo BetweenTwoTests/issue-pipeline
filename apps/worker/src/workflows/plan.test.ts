@@ -67,6 +67,7 @@ test("planWorkflow: an abort signal during the blocking-questions wait ends the 
       postComment: async (_repo: unknown, _issueNumber: number, body: string) => {
         posted.push(body);
       },
+      buildTranscriptFooter: async () => "",
     },
   });
 

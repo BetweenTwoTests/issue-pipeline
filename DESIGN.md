@@ -393,6 +393,16 @@ and surfaced, never thrown on) and renders prompts, assistant text, thinking
 blocks, tool calls paired with their results by `tool_use_id`, and subagent
 sidechain groups. `just transcripts` → http://127.0.0.1:8845.
 
+The pipeline links back into it: worklog comments (executor/fixer, per
+attempt) and the root issue's phase-map comment (planner) end with an
+"Agent session transcript" footer deep-linking that run's session —
+`buildTranscriptFooter` in `packages/activities/src/agents.ts`, URL shape in
+`packages/core/src/transcript-link.ts` (which replicates Claude Code's
+cwd→directory flattening). `PIPELINE_VIEWER_URL` (default
+http://localhost:8845) feeds both the viewer's listen port and those links,
+so one variable moves both; the env read happens in the activity because
+workflow code cannot touch `process.env`.
+
 Three decisions worth knowing before touching it:
 
 - **One process, loopback only.** The transcript API is Connect middleware
@@ -413,4 +423,6 @@ Three decisions worth knowing before touching it:
   It is the only ESM (`"type": "module"`), JSX, bundler-resolution package;
   `build` is `tsc --noEmit && vite build`, still emitting `dist/**` so turbo
   caching works unchanged. It imports no workspace packages — keep it that
-  way rather than teaching core/adapters about the session store.
+  way. Pipeline-side knowledge of the session store is capped at the pure
+  URL/dir-name shape in core's `transcript-link.ts`; all store I/O stays in
+  the viewer's own server code.
